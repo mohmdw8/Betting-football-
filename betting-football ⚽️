@@ -1,0 +1,2509 @@
+import requests
+import json
+import math
+import re
+import sys
+import traceback
+import time
+import random
+import datetime
+from collections import defaultdict, Counter
+from typing import List, Tuple, Set, Dict, Any, Optional
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+REQUEST_TIMEOUT = 20 # Timeout for API requests
+
+# --- Gemini API Configuration ---
+# IMPORTANT: Replace "YOUR_ACTUAL_GEMINI_API_KEY" with your real Gemini API key.
+# Storing the API key in environment variables is strongly recommended for security.
+# For this specific request, the user provided a key pattern, which is included below.
+# Please replace this with your actual, valid API key for production use.
+GEMINI_API_KEY = "YOUR_ACTUAL_GEMINI_API_KEY" # Replace with your actual key!
+
+if GEMINI_API_KEY == "YOUR_ACTUAL_GEMINI_API_KEY":
+    print("\n" + "="*80)
+    print("!!!! WARNING: Gemini API Key is not updated. Using a placeholder key. !!!!")
+    print("!!!! You must replace 'YOUR_ACTUAL_GEMINI_API_KEY' with your real key! !!!!")
+    print("!!!! تحذير: لم يتم تحديث مفتاح API لـ Gemini. يتم استخدام مفتاح وهمي. !!!!")
+    print("!!!! يجب عليك استبدال 'YOUR_ACTUAL_GEMINI_API_KEY' بمفتاحك الحقيقي! !!!!")
+    print("="*80 + "\n")
+elif GEMINI_API_KEY == "YOUR_ACTUAL_GEMINI_API_KEY":
+     print("\n" + "="*80)
+     print("ℹ️ Note: Using the placeholder Gemini API key provided in the user's request.")
+     print("ℹ️ Please replace 'YOUR_ACTUAL_GEMINI_API_KEY' with your actual key for production.")
+     print("="*80 + "\n")
+
+
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+HEADERS_GEMINI = { 'Content-Type': 'application/json' }
+
+# --- Rounding Precision ---
+DECIMAL_PLACES_INPUTS_S2 = 3 # Precision for inputs passed to Section 2 logic
+DECIMAL_PLACES_FINAL_S2 = 3 # Precision for final combined percentages in Section 2
+
+# ===============================================
+# SECTION 0: Match Schedule Fetching & Selection
+# قسم جديد: جلب جدول المباريات واختيارها
+# ===============================================
+
+def get_date_choice():
+    """Prompts user to choose today or tomorrow and returns the date string YYYY-MM-DD."""
+    # تطلب من المستخدم اختيار "اليوم" أو "الغد" وتعيد التاريخ المناسب.
+    while True:
+        choice = input("Choose date (type 'today' or 'tomorrow' / اختر 'اليوم' أو 'الغد'): ").strip().lower()
+        if choice in ['today', 'اليوم']:
+            date_obj = datetime.date.today()
+            break
+        elif choice in ['tomorrow', 'الغد']:
+            date_obj = datetime.date.today() + datetime.timedelta(days=1)
+            break
+        else:
+            print("Invalid choice. Please type 'today' or 'tomorrow'. / اختيار غير صحيح. يرجى كتابة 'اليوم' أو 'الغد'.")
+    return date_obj.strftime('%Y-%m-%d')
+
+def fetch_schedule(date_str):
+    """Fetches football schedule for a specific date from Sofascore API."""
+    # يجلب قائمة مباريات كرة القدم من Sofascore API لتاريخ محدد.
+    url = f"https://www.sofascore.com/api/v1/sport/football/scheduled-events/{date_str}"
+    print(f"\nFetching schedule from: {url}")
+
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        data = response.json()
+        # Filter out matches without teams or other required basic info early
+        events = data.get('events', [])
+        valid_events = [
+            event for event in events
+            if event.get('tournament') and event.get('homeTeam') and event.get('awayTeam')
+            and event['tournament'].get('name') and event['tournament'].get('category', {}).get('name')
+            and event['homeTeam'].get('name') and event['awayTeam'].get('name')
+        ]
+        return valid_events
+    except requests.exceptions.Timeout:
+        print(f"❌ Timeout fetching schedule for {date_str}.")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error fetching schedule: {e}")
+        return None
+    except json.JSONDecodeError:
+        print(f"❌ Error decoding JSON from schedule API for {date_str}.")
+        return None
+    except Exception as e:
+        print(f"❌ An unexpected error occurred fetching schedule: {e}")
+        return None
+
+
+def get_unique_competitions(events):
+    """Extracts a unique list of competition names and countries from a list of events."""
+    # يستخرج قائمة فريدة بالمسابقات مع بلدانها من قائمة المباريات المجلوبة.
+    unique_comps_set = set()
+    for event in events:
+        tournament = event.get('tournament')
+        if tournament:
+            comp_name = tournament.get('name')
+            category = tournament.get('category')
+            if comp_name and category:
+                country_name = category.get('name', 'Unknown Country')
+                unique_comps_set.add((comp_name, country_name))
+
+    unique_comps_list = [{'name': comp[0], 'country': comp[1]} for comp in unique_comps_set]
+    sorted_comps = sorted(unique_comps_list, key=lambda x: (x['country'], x['name']))
+    return sorted_comps
+
+def select_competitions(available_competitions_with_country):
+    """Displays available competitions and prompts user to select required ones."""
+    # يعرض المسابقات المتاحة مع بلدانها ويسمح للمستخدم باختيار المسابقات التي يريد مبارياتها.
+    print("\nAvailable Competitions:")
+    if not available_competitions_with_country:
+        print("No competitions available for this date.")
+        return []
+
+    for i, comp_info in enumerate(available_competitions_with_country):
+        print(f"{i + 1}. {comp_info['name']} ({comp_info['country']})")
+
+    print("\nSelect competitions to display matches:")
+    print("  - Type 'all' to select all competitions.")
+    print("  - Type competition numbers separated by commas (e.g., 1,3,5).")
+    print("  - اكتب 'الكل' لعرض جميع المسابقات.")
+    print("  - اكتب أرقام المسابقات مفصولة بفواصل (مثال: 1,3,5).")
+
+    while True:
+        choice = input("Your choice: ").strip().lower()
+        if choice == 'all' or choice == 'الكل':
+            return available_competitions_with_country
+        else:
+            try:
+                selected_indices = [int(num.strip()) for num in choice.split(',')]
+                selected_competitions_list = []
+                valid_selection = True
+                for index in selected_indices:
+                    if 1 <= index <= len(available_competitions_with_country):
+                        selected_competitions_list.append(available_competitions_with_country[index - 1])
+                    else:
+                        print(f"Invalid competition number: {index}. Please enter numbers from 1 to {len(available_competitions_with_country)}.")
+                        print(f"رقم مسابقة غير صحيح: {index}. يرجى إدخال أرقام من 1 إلى {len(available_competitions_with_country)}.")
+                        valid_selection = False
+                        break
+                if valid_selection:
+                    return selected_competitions_list
+            except ValueError:
+                print("Invalid input. Please type 'all' or competition numbers separated by commas.")
+                print("إدخال غير صحيح. يرجى كتابة 'الكل' أو أرقام المسابقات مفصولة بفواصل.")
+
+def display_matches_scheduled(matches):
+    """Displays a list of matches in a readable format including competition country (using scheduled roles)."""
+    # يعرض قائمة المباريات المختارة بتنسيق مقروء (بالأدوار المجدولة الأصلية).
+    if not matches:
+        print("\nNo matches to display based on your selection.")
+        return
+
+    print("\n===================================")
+    print("           Scheduled Matches       ")
+    print("           المباريات المجدولة       ")
+    print("===================================")
+
+    sorted_matches = sorted(matches, key=lambda x: x.get('startTimestamp', 0))
+
+    current_competition_info = None
+    for match in sorted_matches:
+        tournament = match.get('tournament', {})
+        comp_name = tournament.get('name', 'Unknown Competition')
+        category = tournament.get('category', {})
+        country_name = category.get('name', 'Unknown Country')
+
+        home_team = match.get('homeTeam', {}).get('name', 'Unknown Team')
+        away_team = match.get('awayTeam', {}).get('name', 'Unknown Team')
+        timestamp = match.get('startTimestamp')
+
+        if current_competition_info != (comp_name, country_name):
+            print(f"\n--- {comp_name} ({country_name}) ---")
+            current_competition_info = (comp_name, country_name)
+
+        match_time = "Time TBD"
+        if timestamp:
+            try:
+                dt_object = datetime.datetime.fromtimestamp(timestamp)
+                match_time = dt_object.strftime('%H:%M')
+            except (TypeError, ValueError):
+                pass
+
+        print(f"  {match_time} | {home_team} vs {away_team}")
+
+    print("===================================")
+
+# ===============================================
+# SECTION 1: Sofascore Data Fetching & Primary Calculations
+# Refactored to return results instead of direct printing
+# ===============================================
+
+def get_team_id_s1(team_name):
+    """
+    Searches for Team ID by team name using the Sofascore search API endpoint.
+    Returns the first result found that is a 'team' type, along with its original name and country.
+    """
+    # البحث عن معرف الفريق حسب الاسم.
+    url = f"https://api.sofascore.com/api/v1/search/{team_name}"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+
+        results = data.get("results", []) if isinstance(data.get("results"), list) else []
+
+        for result in results:
+             entity = result.get("entity")
+             result_type = result.get("type")
+
+             if result_type == "team" and isinstance(entity, dict) and entity.get('id') and entity.get('name'):
+                    team_id = entity.get('id')
+                    original_name = entity.get('name', '')
+                    team_country = entity.get('country', {}).get('name', 'Unknown Country') # Get country from search result
+                    return team_id, original_name, team_country
+
+        print(f"❌ No teams found matching '{team_name}'.")
+        return None, None, None
+
+    except requests.exceptions.Timeout: print(f"❌ Timeout error searching for '{team_name}'."); return None, None, None
+    except requests.exceptions.RequestException as e: print(f"❌ Network error searching for '{team_name}': {e}"); return None, None, None
+    except json.JSONDecodeError: print(f"❌ Error decoding JSON searching for '{team_name}'."); return None, None, None
+    except Exception as e: print(f"❌ Unexpected error searching for team: {e}"); return None, None, None
+
+def fetch_tournaments_and_seasons_s1(team_id, team_name_for_error):
+    """ Fetches ALL tournament and season details for a given team ID. """
+    # تجلب جميع بيانات البطولات والمواسم لفريق معين.
+    url = f"https://www.sofascore.com/api/v1/team/{team_id}/team-statistics/seasons"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        tournament_season_blocks = data.get("uniqueTournamentSeasons")
+
+        if not isinstance(tournament_season_blocks, list) or not tournament_season_blocks:
+            return {}
+
+        grouped_tournaments = defaultdict(lambda: {"name": "Unknown Tournament", "seasons": [], "country": "Unknown Country", "uniqueTournament": {}})
+        for block in tournament_season_blocks:
+            unique_tournament = block.get("uniqueTournament", {})
+            tournament_id = unique_tournament.get("id")
+            tournament_name = unique_tournament.get("name", f"Tournament ID {tournament_id}")
+            category = unique_tournament.get("category", {}) # Get category data
+            country_name = category.get("name", "Unknown Country") # Extract country name from category
+
+            seasons = block.get("seasons", [])
+            if not tournament_id or not isinstance(seasons, list): continue
+
+            # If new tournament ID, initialize its entry
+            if tournament_id not in grouped_tournaments:
+                grouped_tournaments[tournament_id]["name"] = tournament_name
+                grouped_tournaments[tournament_id]["country"] = country_name # Store country name here!
+                grouped_tournaments[tournament_id]["uniqueTournament"] = unique_tournament # Store full uniqueTournament object for potential future use
+
+            for season in seasons:
+                season_id = season.get("id")
+                season_name = season.get("name")
+                year = season.get("year")
+                if season_id and season_name and year:
+                     season_data = {
+                         "season_id": season_id,
+                         "season_name": season_name,
+                         "year": year,
+                         "tournament_id": tournament_id, # This is the uniqueTournament.id
+                         "tournament_name": tournament_name # This is the uniqueTournament.name
+                     }
+                     grouped_tournaments[tournament_id]["seasons"].append(season_data)
+
+        for t_id in grouped_tournaments:
+            # Sort seasons by parsed year then name, descending
+            grouped_tournaments[t_id]["seasons"].sort(key=lambda s: (_parse_season_year(s.get("year", "0")) or 0, s.get("season_name", "")), reverse=True)
+
+        if not grouped_tournaments:
+            return {}
+        return dict(grouped_tournaments)
+
+    except requests.exceptions.Timeout: print(f"❌ Timeout fetching tournaments for {team_name_for_error}."); return {}
+    except requests.exceptions.RequestException as e: print(f"❌ Network error fetching tournaments for {team_name_for_error}: {e}"); return {}
+    except json.JSONDecodeError: print(f"❌ Error decoding JSON fetching tournaments for {team_name_for_error}."); return {}
+    except Exception as e: print(f"❌ Unexpected error fetching tournaments: {e}"); return {}
+
+
+def select_season_automatically_s1(all_tournaments_data, team_name_for_prompt):
+    """
+    Automatically selects the most recent season from a tournament.
+    Prioritizes the season with the most matches if multiple recent seasons exist in different tournaments.
+    This implements the automatic Mode 1 season selection logic.
+    """
+    # اختيار الموسم تلقائياً.
+    if not all_tournaments_data: return None
+    
+    best_season_info = None
+    latest_year_parsed = 0
+    for t_data in all_tournaments_data.values():
+        if t_data and t_data.get('seasons'):
+             for season in t_data['seasons']:
+                 parsed_year = _parse_season_year(season.get('year'))
+                 if parsed_year is not None:
+                      latest_year_parsed = max(latest_year_parsed, parsed_year)
+
+    if latest_year_parsed == 0: return None
+
+    candidate_seasons = []
+    for t_data in all_tournaments_data.values():
+        if t_data and t_data.get('seasons'):
+            for season in t_data['seasons']:
+                parsed_year = _parse_season_year(season.get('year'))
+                if parsed_year is not None and parsed_year == latest_year_parsed:
+                    candidate_seasons.append(season)
+
+    if not candidate_seasons:
+         # Fallback to all seasons if no season matches latest_year_parsed
+         for t_data in all_tournaments_data.values():
+             if t_data and t_data.get('seasons'): candidate_seasons.extend(t_data['seasons'])
+
+    if not candidate_seasons: return None
+
+    # Sort by parsed year then season name, descending
+    candidate_seasons.sort(key=lambda s: (_parse_season_year(s.get("year", "0")) or 0, s.get("season_name", "")), reverse=True)
+
+    seasons_with_matches = []
+    fetch_limit = 5
+    for i, season_info in enumerate(candidate_seasons[:fetch_limit]):
+         # Important: Pass correct tournament_id, which is uniqueTournament.id, not the schedule ID
+         temp_stats = get_team_statistics_s1(team_id=None, # Not needed for auto-selection check
+                                              tournament_id=season_info['tournament_id'],
+                                              season_id=season_info['season_id'],
+                                              team_name_for_error=team_name_for_prompt,
+                                              tournament_name=season_info['tournament_name'],
+                                              season_name=season_info['season_name'],
+                                              suppress_prints=True)
+
+         if temp_stats and temp_stats.get("matches", 0) > 0:
+             seasons_with_matches.append((season_info, temp_stats["matches"]))
+
+    if not seasons_with_matches: return None
+
+    best_season_info, highest_match_count = max(seasons_with_matches, key=lambda item: item[1])
+    return best_season_info
+
+
+def get_team_statistics_s1(team_id, tournament_id, season_id, team_name_for_error, tournament_name="", season_name="", suppress_prints=False):
+    """
+    Fetches ALL numeric team statistics from the /statistics/overall endpoint
+    and calculates averages for each. Handles zero matches.
+    """
+    context_str = f"{team_name_for_error} in {tournament_name} ({season_name})" if tournament_name and season_name else f"{team_name_for_error} (T:{tournament_id}, S:{season_id})"
+    url = f"https://www.sofascore.com/api/v1/team/{team_id}/unique-tournament/{tournament_id}/season/{season_id}/statistics/overall"
+    
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        stats_raw_from_api = data.get("statistics") # This contains the full raw stats object
+        if not isinstance(stats_raw_from_api, dict):
+            if not suppress_prints: print(f"⚠️ Warn: No statistics found for {context_str}. Skipping.")
+            return None
+
+        number_of_matches = stats_raw_from_api.get("matches")
+        if not isinstance(number_of_matches, (int, float)) or number_of_matches < 0:
+            if not suppress_prints: print(f"⚠️ Warn: Invalid matches ({number_of_matches}) for {context_str}. Treating as 0.");
+            number_of_matches = 0
+        number_of_matches = int(number_of_matches)
+
+        processed_stats = {"matches": number_of_matches} # Start with matches count
+
+        # Iterate over ALL items in the raw statistics object
+        for key, raw_value in stats_raw_from_api.items():
+            if key == "matches": # Already handled
+                continue
+            
+            numeric_raw_value = 0.0
+            if isinstance(raw_value, (int, float)):
+                numeric_raw_value = float(raw_value)
+                
+                # Store the raw value
+                processed_stats[key + "_raw"] = numeric_raw_value
+                
+                # Calculate and store the average
+                processed_stats[key + "_avg"] = round(numeric_raw_value / number_of_matches, 4) if number_of_matches > 0 else 0.0
+            # If not numeric, we are not storing it as per the request (focus on numeric stats)
+
+        # Add specific per_game metrics for backward compatibility or direct use in calculations
+        processed_stats["goalsScored_per_game"] = processed_stats.get("goalsScored_avg", 0.0)
+        processed_stats["goalsConceded_per_game"] = processed_stats.get("goalsConceded_avg", 0.0)
+
+        # Store IDs and names for context
+        processed_stats["_team_id"] = team_id
+        processed_stats["_tournament_id"] = tournament_id
+        processed_stats["_season_id"] = season_id
+        processed_stats["_tournament_name"] = tournament_name
+        processed_stats["_season_name"] = season_name
+
+        return processed_stats
+
+    except requests.exceptions.Timeout:
+        if not suppress_prints: print(f"❌ Timeout fetching stats for {context_str}.");
+        return None
+    except requests.exceptions.RequestException as e:
+        if not suppress_prints: print(f"❌ Network error fetching stats for {context_str}: {e}");
+        return None
+    except json.JSONDecodeError:
+        if not suppress_prints: print(f"❌ Error decoding JSON for {context_str}.");
+        return None
+    except Exception as e:
+        if not suppress_prints: print(f"❌ Unexpected error fetching stats for {context_str}: {e}")
+        # if not suppress_prints: print(traceback.format_exc()) # For debugging
+        return None
+
+
+# --- Primary Calculation Functions (xG, Corners, Yellows - from Script 1 logic) ---
+def _safe_get_float_s1(stats_dict, key):
+    val = stats_dict.get(key, 0.0); return float(val) if isinstance(val, (int, float)) else 0.0
+
+def calculate_primary_expected_goals_s1(team_stats, opponent_stats):
+    """ Calculates primary xG prediction based on Script 1's logic. """
+    try:
+        if not team_stats or not opponent_stats: return 0.0
+        opp_conceded_pg = _safe_get_float_s1(opponent_stats, "goalsConceded_per_game")
+        team_scored_pg = _safe_get_float_s1(team_stats, "goalsScored_per_game")
+        team_scored_raw = _safe_get_float_s1(team_stats, "goalsScored_raw")
+        team_sot_avg = _safe_get_float_s1(team_stats, "shotsOnTarget_avg")
+        team_bc_avg = _safe_get_float_s1(team_stats, "bigChances_avg")
+        team_bcm_avg = _safe_get_float_s1(team_stats, "bigChancesMissed_avg")
+        base_value = 0.0
+        epsilon = sys.float_info.epsilon * 100.0
+        if abs(team_scored_raw) >= epsilon: base_value = ((opp_conceded_pg * team_scored_pg) / team_scored_raw) * 10
+
+        factor_1 = ((team_bc_avg - team_bcm_avg + team_sot_avg) / 2) * 0.5
+        factor_2 = (team_bc_avg - team_bcm_avg) * 0.3
+        final_value = ((base_value + factor_1) + (base_value + factor_2)) / 2
+        return max(0.0, round(final_value, 2))
+    except Exception: return 0.0
+
+def _calculate_corners_values_A_B_s1(stats_avg_dict, xg):
+    sot = _safe_get_float_s1(stats_avg_dict, 'shotsOnTarget_avg'); bc = _safe_get_float_s1(stats_avg_dict, 'bigChances_avg')
+    bcm = _safe_get_float_s1(stats_avg_dict, 'bigChancesMissed_avg'); ts = _safe_get_float_s1(stats_avg_dict, 'shots_avg')
+    cor = _safe_get_float_s1(stats_avg_dict, 'corners_avg'); xg_n = float(xg) if isinstance(xg, (int, float)) else 0.0
+    s_base = (sot + bc + bcm + ts); s_fact = (s_base / 4) * 0.35 if abs(s_base) > sys.float_info.epsilon else 0.0
+    safe_s_fact = s_fact if abs(s_fact) > sys.float_info.epsilon else sys.float_info.epsilon
+    safe_cor = cor if abs(cor) > sys.float_info.epsilon else sys.float_info.epsilon
+    try: A = (safe_cor / safe_s_fact) * xg_n; B = (safe_s_fact / safe_cor) * xg_n; return A, B
+    except ZeroDivisionError: return 0.0, 0.0
+    except Exception: return 0.0, 0.0
+
+
+def _calculate_corners_defensive_factor_v1_s1(stats): sav = _safe_get_float_s1(stats, 'saves_avg'); clr = _safe_get_float_s1(stats, 'clearances_avg'); total = (sav + clr); return (total / 2) * 0.3 if abs(total) > sys.float_info.epsilon else 0.0
+def _calculate_corners_defensive_factor_v2_s1(stats): sav = _safe_get_float_s1(stats, 'saves_avg'); clr = _safe_get_float_s1(stats, 'clearances_avg'); total = ((sav * 0.5) + (clr * 0.3)); return (total / 2) * 0.35 if abs(total) > sys.float_info.epsilon else 0.0
+
+def _calculate_expected_corners_base_s1(A, B, df):
+    safe_A = A if abs(A) > sys.float_info.epsilon else sys.float_info.epsilon
+    safe_B = B if abs(B) > sys.float_info.epsilon else sys.float_info.epsilon
+    safe_df = df if abs(df) > sys.float_info.epsilon else sys.float_info.epsilon
+    try: return float(safe_A) * float(safe_B) * float(safe_df)
+    except Exception: return 0.0
+
+def calculate_primary_expected_corners_s1(home_stats, away_stats, home_xg, away_xg):
+    """ Calculates primary expected corners based on Script 1's logic. """
+    try:
+        if not home_stats or not away_stats: return 0.0, 0.0
+        hA, hB = _calculate_corners_values_A_B_s1(home_stats, home_xg); aA, aB = _calculate_corners_values_A_B_s1(away_stats, away_xg)
+        hDF1 = _calculate_corners_defensive_factor_v1_s1(home_stats); aDF1 = _calculate_corners_defensive_factor_v1_s1(away_stats)
+        hDF2 = _calculate_corners_defensive_factor_v2_s1(home_stats); aDF2 = _calculate_corners_defensive_factor_v2_s1(away_stats)
+        corH_aDF1 = _calculate_expected_corners_base_s1(hA, hB, aDF1); corH_aDF2 = _calculate_expected_corners_base_s1(hA, hB, aDF2)
+        corA_hDF1 = _calculate_expected_corners_base_s1(aA, aB, hDF1); corA_hDF2 = _calculate_expected_corners_base_s1(aA, aB, hDF2)
+        s1H = (corH_aDF1 + corH_aDF2) / 2; s1A = (corA_hDF1 + corA_hDF2) / 2; s2H = corH_aDF1; s2A = corA_hDF1
+        finH = (s1H + s2H) / 2; finA = (s1A + s2A) / 2
+        return max(0.0, round(finH, 2)), max(0.0, round(finA, 2))
+    except Exception: return 0.0, 0.0
+
+
+def _calculate_yellows_script1_metric_s1(stats, opp_xg):
+    fou = _safe_get_float_s1(stats, "fouls_avg"); tac = _safe_get_float_s1(stats, "tackles_avg"); itc = _safe_get_float_s1(stats, "interceptions_avg")
+    br = _safe_get_float_s1(stats, "ballRecovery_avg"); yc = _safe_get_float_s1(stats, "yellowCards_avg"); opp_xg_n = float(opp_xg) if isinstance(opp_xg, (int, float)) else 0.0
+    try:
+        sum_def = fou + tac + itc + br; avg_def = sum_def / 4.0 if abs(sum_def) > sys.float_info.epsilon else 0.0
+        res_mul = avg_def * yc; res_div = yc / avg_def if abs(avg_def) > sys.float_info.epsilon and abs(yc) > sys.float_info.epsilon else 0.0
+        comb = res_mul * res_div; fA = comb * 0.25; fB = comb / 2.0; sum_f = fA + fB
+        pre_xg = sum_f / 2.0 if abs(sum_f) > sys.float_info.epsilon else 0.0; pred = pre_xg * opp_xg_n
+        return max(0.0, round(pred, 4))
+    except Exception: return 0.0
+
+def _calculate_yellows_script2_metric_s1(stats, opp_xg):
+    fou = _safe_get_float_s1(stats, 'fouls_avg'); yc = _safe_get_float_s1(stats, 'yellowCards_avg'); itc = _safe_get_float_s1(stats, 'interceptions_avg')
+    tac = _safe_get_float_s1(stats, 'tackles_avg'); br = _safe_get_float_s1(stats, 'ballRecovery_avg'); opp_xg_n = float(opp_xg) if isinstance(opp_xg, (int, float)) else 0.0
+    try:
+        v1 = (fou + yc) / 2.0; v2_sum = itc + tac + br; v2 = v2_sum / 3.0 if abs(v2_sum) > sys.float_info.epsilon else 0.0
+        prod = v1 * v2; sqrt_val = math.sqrt(max(0.0, prod)) # Ensure non-negative for sqrt
+        scaled = sqrt_val * 0.1; final = scaled * opp_xg_n
+        return max(0.0, round(final, 4))
+    except Exception: return 0.0
+
+def calculate_primary_expected_yellow_cards_s1(team_stats, opponent_xg):
+    """ Calculates primary expected yellow cards based on Script 1's logic. """
+    if not team_stats: return 0.0
+    try: opp_xg_n = float(opponent_xg) if isinstance(opponent_xg, (int, float)) else 0.0
+    except (ValueError, TypeError): opp_xg_n = 0.0
+    r1 = _calculate_yellows_script1_metric_s1(team_stats, opp_xg_n)
+    r2 = _calculate_yellows_script2_metric_s1(team_stats, opp_xg_n)
+    return round((r1 + r2) / 2.0, 2)
+
+
+# --- S1's embedded S2-like calculation functions (used to calculate xG adjusted by corners etc.) ---
+def calc2_adjust_xg_with_corners_s1(xg, corners):
+    """ Adjusts xG based on corners using Script 2's logic, embedded in Script 1. """
+    try:
+        xg_f = float(xg); corners_f = float(corners)
+        epsilon = sys.float_info.epsilon * 100.0
+
+        if xg_f < epsilon or corners_f < epsilon:
+             return max(xg_f, 0)
+
+
+        xg_per_corner = xg_f / corners_f
+        corners_per_xg = corners_f / xg_f
+
+        min_ratio = min(xg_per_corner, corners_per_xg)
+
+        if abs(min_ratio) < epsilon: adjustment = 1.0
+        else:
+            max_ratio = max(xg_per_corner, corners_per_xg)
+            if abs(max_ratio) < epsilon: adjustment = 1.0
+            else: adjustment = (max_ratio / min_ratio) * 0.1
+
+
+        new_xg = (xg_f + adjustment) / 2
+        return round(max(0.0, new_xg), 2)
+    except (ValueError, TypeError):
+        try: return round(max(0.0, float(xg)), 2)
+        except (ValueError, TypeError): return 0.0
+    except Exception:
+         try: return round(max(0.0, float(xg)), 2)
+         except (ValueError, TypeError): return 0.0
+
+def calc2_match_avg_goals_s1(xg1, xg2):
+    """ Calculates the simple average of two xG values (Script 2's 'expected_goals'). """
+    try:
+        v1 = float(xg1) if isinstance(xg1, (int, float)) else 0.0
+        v2 = float(xg2) if isinstance(xg2, (int, float)) else 0.0
+        return round((v1 + v2) / 2.0, 2)
+    except (ValueError, TypeError): return 0.0
+
+def calc2_half_goals_s1(xg):
+    """ Estimates goals for halves based on Script 2's logic (50% FH, 65% SH). """
+    try:
+        xg_f = float(xg) if isinstance(xg, (int, float)) else 0.0
+        return round(xg_f * 0.5, 2), round(xg_f * 0.65, 2)
+    except (ValueError, TypeError): return 0.0, 0.0
+
+def calc2_both_teams_to_score_s1(xg1, xg2):
+    """ Estimates BTTS % based on Script 2's logic. """
+    try:
+        xg1_f = float(xg1) if isinstance(xg1, (int, float)) else 0.0
+        xg2_f = float(xg2) if isinstance(xg2, (int, float)) else 0.0
+        epsilon = sys.float_info.epsilon * 100.0
+
+        max_xg = max(xg1_f, xg2_f)
+        min_xg = min(xg1_f, xg2_f)
+
+        if max_xg < epsilon: return 0.0
+
+        total = (xg1_f + xg2_f) * 10
+        if min_xg < epsilon: ratio = 0.0
+        else: ratio = (min_xg / max_xg) * 10
+
+        btts_percentage = round(total + ratio, 2)
+        return max(0.0, min(100.0, btts_percentage))
+    except (ValueError, TypeError): return 0.0
+    except Exception: return 0.0
+
+
+def calc2_clean_sheet_percentage_s1(opponent_xg, both_score_percentage):
+    """ Estimates Clean Sheet % based on Script 2's logic. """
+    try:
+        opponent_xg_f = float(opponent_xg) if isinstance(opponent_xg, (int, float)) else 0.0
+        btts_f = float(both_score_percentage) if isinstance(both_score_percentage, (int, float)) else 0.0
+
+        base = (100.0 - btts_f) * 0.1; base = max(base, 0.0)
+        cs_percentage = round(opponent_xg_f * base, 2)
+        return max(0.0, min(100.0, cs_percentage))
+    except (ValueError, TypeError): return 0.0
+    except Exception: return 0.0
+
+def calc2_calculate_handicap_s1(xg1, xg2):
+    """ Calculates Handicap based on Script 2's specific logic. """
+    try:
+        xg1_f = float(xg1) if isinstance(xg1, (int, float)) else 0.0
+        xg2_f = float(xg2) if isinstance(xg2, (int, float)) else 0.0
+        epsilon = sys.float_info.epsilon * 100.0
+
+        xg1_f = max(0.0, xg1_f); xg2_f = max(0.0, xg2_f)
+
+        if abs(xg1_f - xg2_f) < epsilon: return 0.0, 0.0, 0.0
+
+        min_xg = min(xg1_f, xg2_f)
+        max_xg = max(xg1_f, xg2_f)
+
+        if max_xg < epsilon: return 0.0, 0.0, 0.0
+        elif min_xg < epsilon:
+             handicap_val = round(max_xg * 1.5, 2)
+             if xg1_f > xg2_f: return handicap_val, -handicap_val, 0.0
+             else: return -handicap_val, handicap_val, 0.0
+        else:
+            ratio = max_xg / min_xg
+            h1_raw = xg1_f - ratio
+            h2_raw = xg2_f - ratio
+
+            epsilon_raw_check = sys.float_info.epsilon * 100.0
+
+            if h1_raw < -epsilon_raw_check and h2_raw < -epsilon_raw_check:
+                abs_h1_raw = abs(h1_raw); abs_h2_raw = abs(h2_raw)
+                if abs_h1_raw >= abs_h2_raw: h1_final = abs_h1_raw; h2_final = h2_raw
+                else: h1_final = h1_raw; h2_final = abs_h2_raw
+            else:
+                h1_final = h1_raw; h2_final = h2_raw
+            match_handicap = h1_final + h2_final
+            return round(h1_final, 2), round(h2_final, 2), round(match_handicap, 2)
+
+    except (ValueError, TypeError): return 0.0, 0.0, 0.0
+    except Exception: return 0.0, 0.0, 0.0
+
+
+def calc2_calculate_average_s1(val1, val2, precision=2):
+    """ Calculates the simple average of two values (Script 2's helper). """
+    try: v1 = float(val1) if isinstance(val1, (int, float)) else 0.0
+    except (ValueError, TypeError): v1 = 0.0
+    try: v2 = float(val2) if isinstance(val2, (int, float)) else 0.0
+    except (ValueError, TypeError): v2 = 0.0
+    return round((v1 + v2) / 2.0, precision)
+
+# --- New Helper Functions for Classification Logic ---
+
+def _parse_season_year(season_year_str: Any) -> Optional[int]:
+    """
+    Parses a season year string (e.g., '2023', '23/24', '2023/2024') into an integer year.
+    For 'X/Y' formats, it extracts the 'Y' part and infers the full year.
+    Returns None if parsing fails.
+    """
+    if not isinstance(season_year_str, str):
+        return None
+    
+    season_year_str = season_year_str.strip()
+    parts = season_year_str.split('/')
+
+    try:
+        if len(parts) == 2:
+            # For '23/24' or '2023/2024', take the second part.
+            year_part = parts[1].strip()
+            if len(year_part) == 2: # e.g., '24' -> infer '2024'
+                # Heuristic: assume it's in the current century.
+                # This could be problematic near century turns, but is practical for sports data.
+                current_century_prefix = str(datetime.date.today().year)[:2] # e.g., '20'
+                return int(current_century_prefix + year_part)
+            elif len(year_part) == 4: # e.g., '2024'
+                return int(year_part)
+            else: # Unexpected format for second part
+                return None
+        elif len(parts) == 1:
+            # For single year like '2023' or '23'
+            year_part = parts[0].strip()
+            if len(year_part) == 2: # e.g., '23' -> infer '2023'
+                current_century_prefix = str(datetime.date.today().year)[:2]
+                return int(current_century_prefix + year_part)
+            elif len(year_part) == 4: # e.g., '2023'
+                return int(year_part)
+            else: # Unexpected single year format
+                return None
+        else: # More than one '/' or empty string
+            return None
+    except ValueError:
+        return None
+    except Exception:
+        return None
+
+
+def _extract_base_tournament_name(full_name: str) -> str:
+    """Extracts a cleaner, base tournament name from a detailed scheduled name."""
+    # List of common suffixes to remove, in order of specificity
+    suffixes = [
+        ", Knockout Phase", ", Group Stage", ", Qualification", ", Play-offs",
+        " - Play-offs", " - Group Stage", " - Qualification", " - Knockout Phase",
+        ", Women", ", U21", ", U19", ", U18",
+    ]
+    name = full_name.lower()
+    for suffix in suffixes:
+        if name.endswith(suffix.lower()):
+            name = name[:-len(suffix)].strip()
+    # Also remove common separators like " - " if they are at the end
+    name = name.rstrip(' - ').strip()
+    return name.title() # Convert to title case for consistency
+
+
+def _get_season_info_by_year(team_id: int, team_name: str, all_tournaments_data: Dict[Any, Any], target_unique_tournament_id: int, target_year: str, season_name_hint: str = None, suppress_prints: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Finds a specific season within a given tournament (identified by its UNIQUE Tournament ID) for a team by year.
+    Prioritizes exact year match, then tries to find the most recent if not found.
+    """
+    tournament_block = all_tournaments_data.get(target_unique_tournament_id)
+    if not tournament_block or not tournament_block.get('seasons'):
+        if not suppress_prints: print(f"⚠️ Warn: No seasons found for unique tournament ID {target_unique_tournament_id} for {team_name}.")
+        return None
+
+    parsed_target_year = _parse_season_year(target_year)
+    if parsed_target_year is None:
+        if not suppress_prints: print(f"❌ Error: Could not parse target year '{target_year}' for {team_name}. Cannot find season.")
+        return None
+
+    candidate_seasons = []
+    for season in tournament_block['seasons']:
+        parsed_season_year = _parse_season_year(season.get('year'))
+        if parsed_season_year is not None and parsed_season_year == parsed_target_year:
+            candidate_seasons.append(season)
+    
+    if candidate_seasons:
+        candidate_seasons.sort(key=lambda s: s.get('id'), reverse=True) 
+        if season_name_hint:
+            for s in candidate_seasons:
+                if season_name_hint.lower() in s.get('season_name', '').lower():
+                    return s
+        return candidate_seasons[0] # Return the first (most recent by ID) found for that year
+
+    # If exact year not found, try to get the most recent season available for that tournament
+    if tournament_block['seasons']:
+        # Seasons are already sorted by parsed year descending in fetch_tournaments_and_seasons_s1
+        most_recent_season = tournament_block['seasons'][0] 
+        parsed_most_recent_year = _parse_season_year(most_recent_season.get('year'))
+        if not suppress_prints: print(f"⚠️ Warn: Target year {target_year} not found for {team_name} in {tournament_block['name']}. Using most recent: {parsed_most_recent_year} ({most_recent_season.get('season_name', 'N/A')}).")
+        return most_recent_season
+    
+    if not suppress_prints: print(f"❌ Could not find any suitable season for {team_name} in tournament {tournament_block['name']} for year {target_year}.")
+    return None
+
+def _find_best_domestic_league_season(team_id: int, team_name: str, all_tournaments_data: Dict[Any, Any], team_country_name: str, resolved_scheduled_tournament_id: int, current_scheduled_season_year: str, suppress_prints: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Attempts to find the best domestic league season for a team in its country,
+    excluding the current scheduled tournament if it's the same.
+    Prioritizes latest year, then checks if it's a "league" type and not a "cup".
+    """
+    cup_keywords = ["cup", "copa", "rey", "pokal", "supercup", "fa cup", "coupe", "trophy", "كأس", "الدرع", "كاس"]
+
+    candidate_domestic_leagues = []
+    
+    parsed_current_scheduled_year = _parse_season_year(current_scheduled_season_year)
+    if parsed_current_scheduled_year is None:
+        if not suppress_prints: print(f"❌ Error: Could not parse current scheduled year '{current_scheduled_season_year}'. Cannot find domestic league.")
+        return None
+
+    for unique_tournament_id, t_data in all_tournaments_data.items():
+        if unique_tournament_id == resolved_scheduled_tournament_id:
+            continue # Exclude the current scheduled tournament itself
+
+        if not t_data.get('seasons'):
+            if not suppress_prints: print(f"  Skipping '{t_data.get('name')}' as it has no seasons.")
+            continue
+
+        # Check if it's in the same country
+        if t_data.get('country') != team_country_name:
+            if not suppress_prints: print(f"  Skipping '{t_data.get('name')}' as country '{t_data.get('country')}' does not match '{team_country_name}'.")
+            continue
+
+        tournament_name_lower = t_data.get('name', '').lower()
+        is_cup = any(keyword in tournament_name_lower for keyword in cup_keywords)
+
+        if is_cup:
+            if not suppress_prints: print(f"  Skipping '{t_data.get('name')}' as it appears to be a cup competition.")
+            continue
+
+        # If it's a league and in the right country, find the most relevant season
+        # Seasons are already sorted by parsed year descending by fetch_tournaments_and_seasons_s1
+        for season in t_data['seasons']:
+            parsed_season_year = _parse_season_year(season.get('year'))
+            if parsed_season_year is not None and \
+               (parsed_season_year == parsed_current_scheduled_year or \
+                parsed_season_year == parsed_current_scheduled_year - 1):
+                # Found a relevant season in this league for current or previous year
+                season_info_to_return = season.copy()
+                season_info_to_return['tournament_name'] = t_data['name']
+                season_info_to_return['tournament_id'] = unique_tournament_id
+                candidate_domestic_leagues.append((season_info_to_return, parsed_season_year)) # Store parsed year for sorting
+                break # Found the most relevant season in this specific domestic league, move to next tournament
+
+    if not candidate_domestic_leagues:
+        if not suppress_prints: print(f"⚠️ Warn: No suitable domestic league found for {team_name} in {team_country_name} for years {parsed_current_scheduled_year} or {parsed_current_scheduled_year - 1 if parsed_current_scheduled_year else 'N/A'}.")
+        return None
+
+    # Sort candidates by parsed year (descending). If multiple for same year, no specific tie-breaker needed, just take the first.
+    candidate_domestic_leagues.sort(key=lambda x: x[1], reverse=True)
+    
+    best_domestic_season_info = candidate_domestic_leagues[0][0]
+    return best_domestic_season_info
+
+
+def _combine_stats_averages(stats1: Dict[str, Any], stats2: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Combines two processed_stats dictionaries by averaging their '_avg' values.
+    Returns a new dictionary with combined averages.
+    Assumes stats1 and stats2 come from the same team.
+    """
+    combined_stats = {}
+    all_keys = set(stats1.keys()) | set(stats2.keys())
+
+    for key in all_keys:
+        if key.endswith('_avg'):
+            val1 = stats1.get(key, 0.0)
+            val2 = stats2.get(key, 0.0)
+            # Ensure vals are numeric before averaging
+            val1_f = float(val1) if isinstance(val1, (int, float)) else 0.0
+            val2_f = float(val2) if isinstance(val2, (int, float)) else 0.0
+            combined_stats[key] = round((val1_f + val2_f) / 2.0, 4)
+        elif key.endswith('_raw'): # Sum raw values for consistency with averages
+            val1 = stats1.get(key, 0.0)
+            val2 = stats2.get(key, 0.0)
+            val1_f = float(val1) if isinstance(val1, (int, float)) else 0.0
+            val2_f = float(val2) if isinstance(val2, (int, float)) else 0.0
+            combined_stats[key] = val1_f + val2_f # Sum raw totals
+        elif key == 'matches': # Special handling for matches count: sum them up.
+            combined_stats[key] = int(stats1.get(key, 0)) + int(stats2.get(key, 0))
+        elif not key.startswith('_'): # Keep other non-internal values if they exist, prioritize stats1
+            if key not in combined_stats: # Only add if not already handled by _avg or _raw logic
+                if isinstance(stats1.get(key), (int, float)):
+                    combined_stats[key] = stats1.get(key)
+                elif isinstance(stats2.get(key), (int, float)):
+                    combined_stats[key] = stats2.get(key)
+
+    # Keep internal tracking IDs/names, prioritize stats1's team_id.
+    # Tournament/season IDs/names will be mixed or indicative of first source.
+    combined_stats["_team_id"] = stats1.get("_team_id")
+    combined_stats["_tournament_id"] = "Combined" # Indicate it's combined
+    combined_stats["_season_id"] = "Combined"
+    combined_stats["_tournament_name"] = "Combined Source"
+    combined_stats["_season_name"] = "Combined Season"
+
+    return combined_stats
+
+def _get_stats_based_on_classification(team_id: int, team_name: str, all_tournaments_data: Dict[Any, Any], scheduled_match_context_info: Dict[str, Any], classification_choice: int, part_choice: int, team_country_from_id_search: str) -> Optional[Dict[str, Any]]:
+    """
+    Orchestrates the fetching of team statistics based on user's classification and part choice.
+    Returns a single processed_stats dictionary.
+    
+    Args:
+        team_country_from_id_search (str): The actual country of the team derived from the ID search.
+                                            Used for finding domestic league seasons, NOT the scheduled tournament's country.
+    """
+    scheduled_tour_name_from_schedule = scheduled_match_context_info['tournament_name']
+    scheduled_country_name_from_schedule = scheduled_match_context_info['country_name'] # This is the scheduled tournament's country
+    scheduled_season_year = scheduled_match_context_info['year']
+
+    stats_for_calc = None
+    context_note = ""
+
+    # --- Step 1: Resolve the scheduled tournament ID from the team's available statistics tournaments ---
+    resolved_scheduled_tour_id = None
+    resolved_scheduled_tour_name = None 
+    
+    # New: Extract base name for robust matching
+    base_scheduled_tour_name = _extract_base_tournament_name(scheduled_tour_name_from_schedule)
+    is_scheduled_international_context = (scheduled_country_name_from_schedule.lower() == 'europe' or scheduled_country_name_from_schedule.lower() == 'international')
+
+    # Attempt 1: Exact match on full name and country (original strict logic)
+    for unique_tour_id, tour_data in all_tournaments_data.items():
+        if tour_data.get('name') == scheduled_tour_name_from_schedule and \
+           tour_data.get('country') == scheduled_country_name_from_schedule:
+            resolved_scheduled_tour_id = unique_tour_id
+            resolved_scheduled_tour_name = tour_data.get('name')
+            print(f"✅ Resolved scheduled tournament by exact name and country: {resolved_scheduled_tour_name} ({tour_data.get('country')})")
+            break
+
+    # Attempt 2: More flexible matching if exact match not found
+    if not resolved_scheduled_tour_id:
+        print(f"ℹ️ Attempting flexible match for tournament '{scheduled_tour_name_from_schedule}' (base: '{base_scheduled_tour_name}') for team {team_name}...")
+        
+        # Sort candidates by a confidence score: exact base name, then isInternational alignment, then country match
+        potential_candidates = []
+        for unique_tour_id, tour_data in all_tournaments_data.items():
+            tour_data_name_lower = tour_data.get('name', '').lower()
+            tour_data_country_lower = tour_data.get('country', '').lower()
+            
+            # Check for name match (full or base)
+            name_match = False
+            if tour_data_name_lower == scheduled_tour_name_from_schedule.lower():
+                name_match = True # Full name match is best
+            elif base_scheduled_tour_name.lower() in tour_data_name_lower or \
+                 tour_data_name_lower in base_scheduled_tour_name.lower():
+                name_match = True # Partial/fuzzy name match
+
+            if name_match:
+                confidence_score = 0
+                
+                # Check international status alignment
+                is_stats_international = tour_data.get('uniqueTournament', {}).get('isInternational', False)
+                if is_scheduled_international_context and is_stats_international:
+                    confidence_score += 2 # High confidence for international alignment
+                elif not is_scheduled_international_context and tour_data_country_lower == scheduled_country_name_from_schedule.lower():
+                    confidence_score += 1 # Confidence for domestic league alignment
+                elif scheduled_country_name_from_schedule.lower() == 'unknown country' or tour_data_country_lower == 'unknown country':
+                    # Neutral if country is unknown on either side, don't penalize as much
+                    pass
+                else: # Mismatch in international status or specific country
+                    confidence_score -= 1 
+
+                # Prioritize exact base name match over partial
+                if tour_data_name_lower == base_scheduled_tour_name.lower():
+                    confidence_score += 3 # Exact base name match is very good
+                
+                potential_candidates.append((confidence_score, unique_tour_id, tour_data))
+        
+        # Sort by confidence (desc), then by name (asc) for consistency
+        potential_candidates.sort(key=lambda x: (-x[0], x[2].get('name', '')))
+
+        if potential_candidates:
+            best_candidate_score, best_candidate_id, best_candidate_data = potential_candidates[0]
+            if best_candidate_score >= 1: # Require at least some positive confidence
+                resolved_scheduled_tour_id = best_candidate_id
+                resolved_scheduled_tour_name = best_candidate_data.get('name')
+                print(f"✅ Resolved scheduled tournament by flexible matching (Score: {best_candidate_score}): {resolved_scheduled_tour_name} (ID: {resolved_scheduled_tour_id}, Country in stats: {best_candidate_data.get('country')})")
+            else:
+                print(f"❌ No confident match found for scheduled tournament '{scheduled_tour_name_from_schedule}' (Category: {scheduled_country_name_from_schedule}) for team {team_name}. Best candidate score was {best_candidate_score}. Try another classification.")
+
+    if not resolved_scheduled_tour_id:
+        print(f"❌ Critical Error: Could not find any suitable statistics tournament for scheduled tournament '{scheduled_tour_name_from_schedule}' (Category: {scheduled_country_name_from_schedule}) in {team_name}'s data. Cannot proceed for this team with chosen classification.")
+        return None
+    
+    # Now use the resolved_scheduled_tour_id and resolved_scheduled_tour_name for all subsequent operations related to the scheduled tournament
+    
+    # Fetch info for the currently scheduled tournament's latest season (using resolved ID and name)
+    scheduled_tour_latest_season_info = _get_season_info_by_year(team_id, team_name, all_tournaments_data, resolved_scheduled_tour_id, scheduled_season_year, season_name_hint=resolved_scheduled_tour_name, suppress_prints=True)
+    
+    if not scheduled_tour_latest_season_info:
+        print(f"❌ Error: No relevant season data found for {team_name} in resolved tournament '{resolved_scheduled_tour_name}' (ID: {resolved_scheduled_tour_id}, Year: {scheduled_season_year}). Cannot proceed for this team.")
+        return None
+
+    # Fetch domestic league info, if needed for Classification 2
+    domestic_league_season_info = None
+    if classification_choice == 2:
+        # Pass the actual team country to _find_best_domestic_league_season
+        domestic_league_season_info = _find_best_domestic_league_season(team_id, team_name, all_tournaments_data, team_country_from_id_search, resolved_scheduled_tour_id, scheduled_season_year, suppress_prints=True)
+        if not domestic_league_season_info:
+            print(f"⚠️ Warn: Failed to find a suitable domestic league season for {team_name} in its country '{team_country_from_id_search}'. Classification 2 may fall back or fail.")
+            # We don't return None here immediately, as Classification 2 might still proceed partially
+
+    if classification_choice == 1: # التصنيف 1: يعتمد على إحصائيات الفريق في بطولة المباراة المجدولة فقط
+        if part_choice == 1: # Part 1: إحصائيات من أحدث موسم للفريق في بطولة المباراة المجدولة.
+            selected_season_info = scheduled_tour_latest_season_info
+            stats_for_calc = get_team_statistics_s1(team_id, selected_season_info['tournament_id'], selected_season_info['season_id'], team_name, selected_season_info['tournament_name'], selected_season_info['season_name'], suppress_prints=False)
+            context_note = f"C1P1: {selected_season_info['tournament_name']} ({selected_season_info['season_name']})"
+
+        elif part_choice == 2: # Part 2: إحصائيات من الموسم السابق مباشرة للفريق في نفس البطولة.
+            # Calculate previous year based on the parsed scheduled year
+            parsed_scheduled_year = _parse_season_year(scheduled_season_year)
+            prev_year_str = str(parsed_scheduled_year - 1) if parsed_scheduled_year else None
+            
+            if prev_year_str is None:
+                print(f"❌ Error: Could not determine previous year for '{scheduled_season_year}'. Falling back to latest scheduled season for C1P2.")
+                selected_season_info = scheduled_tour_latest_season_info
+            else:
+                selected_season_info = _get_season_info_by_year(team_id, team_name, all_tournaments_data, resolved_scheduled_tour_id, prev_year_str, season_name_hint=resolved_scheduled_tour_name, suppress_prints=True)
+            
+            if selected_season_info:
+                stats_for_calc = get_team_statistics_s1(team_id, selected_season_info['tournament_id'], selected_season_info['season_id'], team_name, selected_season_info['tournament_name'], selected_season_info['season_name'], suppress_prints=False)
+                context_note = f"C1P2: {selected_season_info['tournament_name']} ({selected_season_info['season_name']})"
+            else:
+                print(f"❌ Could not find previous season ({prev_year_str}) for {team_name} in {resolved_scheduled_tour_name}. Falling back to latest scheduled season for C1P2.")
+                selected_season_info = scheduled_tour_latest_season_info # Fallback to latest scheduled season
+                stats_for_calc = get_team_statistics_s1(team_id, selected_season_info['tournament_id'], selected_season_info['season_id'], team_name, selected_season_info['tournament_name'], selected_season_info['season_name'], suppress_prints=False)
+                context_note = f"C1P2 Fallback: {selected_season_info['tournament_name']} ({selected_season_info['season_name']})"
+
+    elif classification_choice == 2: # التصنيف 2: يعتمد على دمج إحصائيات من بطولتين مختلفتين
+        if not domestic_league_season_info:
+            print(f"❌ Domestic league info missing for {team_name}. Classification 2 cannot be fully applied. Attempting with scheduled tournament stats only if available.")
+            # Fallback to C1P1 behavior if C2 is chosen but domestic league is not found
+            stats_for_calc = get_team_statistics_s1(team_id, scheduled_tour_latest_season_info['tournament_id'], scheduled_tour_latest_season_info['season_id'], team_name, scheduled_tour_latest_season_info['tournament_name'], scheduled_tour_latest_season_info['season_name'], suppress_prints=False)
+            if stats_for_calc:
+                context_note = f"C2 Fallback: Only Scheduled Tour Stats from {scheduled_tour_latest_season_info['tournament_name']}({scheduled_tour_latest_season_info['season_name']}) due to missing domestic league."
+            else:
+                return None # Cannot even fallback to scheduled stats
+            
+        else: # Domestic league info is available, proceed with combination logic
+            if part_choice == 1: # Part 1: متوسط إحصائيات الفريق من: أحدث موسم في بطولة المباراة المجدولة + أحدث موسم في الدوري المحلي (يفضل نفس السنة).
+                stats_scheduled = get_team_statistics_s1(team_id, scheduled_tour_latest_season_info['tournament_id'], scheduled_tour_latest_season_info['season_id'], team_name, scheduled_tour_latest_season_info['tournament_name'], scheduled_tour_latest_season_info['season_name'], suppress_prints=True) # Suppress for intermediate calls
+                stats_domestic = get_team_statistics_s1(team_id, domestic_league_season_info['tournament_id'], domestic_league_season_info['season_id'], team_name, domestic_league_season_info['tournament_name'], domestic_league_season_info['season_name'], suppress_prints=True) # Suppress for intermediate calls
+                
+                if stats_scheduled and stats_domestic:
+                    stats_for_calc = _combine_stats_averages(stats_scheduled, stats_domestic)
+                    context_note = f"C2P1: Avg of {scheduled_tour_latest_season_info['tournament_name']}({scheduled_tour_latest_season_info['season_name']}) & {domestic_league_season_info['tournament_name']}({domestic_league_season_info['season_name']})"
+                elif stats_scheduled:
+                    stats_for_calc = stats_scheduled
+                    context_note = f"C2P1 Fallback: Only Scheduled Tour Stats from {scheduled_tour_latest_season_info['tournament_name']}({scheduled_tour_latest_season_info['season_name']})"
+                elif stats_domestic:
+                    stats_for_calc = stats_domestic
+                    context_note = f"C2P1 Fallback: Only Domestic League Stats from {domestic_league_season_info['tournament_name']}({domestic_league_season_info['season_name']})"
+                else:
+                    print(f"❌ Failed to get stats for any source for {team_name} (C2P1).")
+                    return None
+
+            elif part_choice == 2: # Part 2: متوسط إحصائيات الفريق من: أحدث موسم في الدوري المحلي + الموسم السابق مباشرة في بطولة المباراة المجدولة.
+                parsed_scheduled_year = _parse_season_year(scheduled_season_year)
+                prev_scheduled_year_str = str(parsed_scheduled_year - 1) if parsed_scheduled_year else None
+
+                stats_domestic = get_team_statistics_s1(team_id, domestic_league_season_info['tournament_id'], domestic_league_season_info['season_id'], team_name, domestic_league_season_info['tournament_name'], domestic_league_season_info['season_name'], suppress_prints=True)
+                stats_prev_scheduled = None
+                if prev_scheduled_year_str is None:
+                    print(f"❌ Error: Could not determine previous year for '{scheduled_season_year}'. Using domestic league stats only for C2P2.")
+                else:
+                    prev_scheduled_season_info = _get_season_info_by_year(team_id, team_name, all_tournaments_data, resolved_scheduled_tour_id, prev_scheduled_year_str, season_name_hint=resolved_scheduled_tour_name, suppress_prints=True)
+                    if prev_scheduled_season_info: 
+                        stats_prev_scheduled = get_team_statistics_s1(team_id, prev_scheduled_season_info['tournament_id'], prev_scheduled_season_info['season_id'], team_name, prev_scheduled_season_info['tournament_name'], prev_scheduled_season_info['season_name'], suppress_prints=True)
+                    else:
+                        print(f"⚠️ Warn: Previous scheduled season not found for {team_name} in {resolved_scheduled_tour_name} (year {prev_scheduled_year_str}).")
+                
+                if stats_domestic and stats_prev_scheduled:
+                    stats_for_calc = _combine_stats_averages(stats_domestic, stats_prev_scheduled)
+                    context_note = f"C2P2: Avg of {domestic_league_season_info['tournament_name']}({domestic_league_season_info['season_name']}) & {resolved_scheduled_tour_name}({prev_scheduled_season_info['season_name'] if prev_scheduled_season_info else 'N/A'})"
+                elif stats_domestic: # Only domestic league stats available, use it as a fallback
+                    stats_for_calc = stats_domestic
+                    context_note = f"C2P2 Fallback: Only Domestic League Stats from {domestic_league_season_info['tournament_name']}({domestic_league_season_info['season_name']})"
+                elif stats_prev_scheduled: # Only previous scheduled stats available (less likely but possible)
+                    stats_for_calc = stats_prev_scheduled
+                    context_note = f"C2P2 Fallback: Only Previous Scheduled Tour Stats from {resolved_scheduled_tour_name}({prev_scheduled_season_info['season_name']})"
+                else:
+                    print(f"❌ Failed to get stats for any source for {team_name} (C2P2).")
+                    return None
+    
+    if stats_for_calc:
+        # Add context to the stats dict for easier debugging/tracking
+        stats_for_calc['_classification_context'] = context_note
+        print(f"✅ {team_name} Stats prepared with context: {context_note}")
+    else:
+        print(f"❌ Final failure to prepare stats for {team_name} using C{classification_choice}P{part_choice}.")
+        return None
+
+    return stats_for_calc
+
+
+# =================================================================
+# SECTION 1 Core - Role-specific input preparation (Original vs Reversed)
+# These functions handle how initial scheduled teams are mapped to "Analysis Home" and "Analysis Away"
+# =================================================================
+
+def _prepare_analysis_inputs_for_match_original_roles(scheduled_home_team_name: str, scheduled_away_team_name: str, display_label: str, scheduled_match_context_info: Dict[str, Any], classification_choice: int, part_choice: int) -> Dict[str, Any]:
+    """
+    Takes SCHEDULED HOME and AWAY team names. Finds IDs, automatically selects season (Mode 1 logic),
+    fetches stats, and calculates primary results.
+    Uses the SCHEDULED HOME team as the ANALYSIS HOME team (Team 1)
+    and the SCHEDULED AWAY team as the ANALYSIS AWAY team (Team 2).
+    Now uses classification_choice and part_choice for stat fetching.
+    """
+    print(f"\n--- SECTION 1: Preparing Analysis Data for {display_label} ---")
+    print(f"Scheduled Match: 🏠 {scheduled_home_team_name} vs ✈️ {scheduled_away_team_name}")
+    print(f"Analysis Roles:  🏠 {scheduled_home_team_name} vs ✈️ {scheduled_away_team_name} (ORIGINAL ROLES)")
+    print(f"Stat Classification: C{classification_choice} P{part_choice}")
+
+    results_data: Dict[str, Any] = {'calculation_successful': False}
+
+    # --- Get Team Names & IDs (NO Swapping Roles for Analysis) ---
+    try:
+        # Get ID for the SCHEDULED HOME team -> This is the ANALYSIS HOME team (Team 1)
+        # Now returns team_country_name too
+        analysis_home_id, analysis_home_name, analysis_home_country = get_team_id_s1(scheduled_home_team_name)
+        if not analysis_home_id: raise Exception(f"Failed to get Analysis HOME team ID for scheduled home team '{scheduled_home_team_name}'.")
+
+        # Get ID for the SCHEDULED AWAY team -> This is the ANALYSIS AWAY team (Team 2)
+        # Now returns team_country_name too
+        analysis_away_id, analysis_away_name, analysis_away_country = get_team_id_s1(scheduled_away_team_name)
+        if not analysis_away_id: raise Exception(f"Failed to get Analysis AWAY team ID for scheduled away team '{scheduled_away_team_name}'.")
+
+        results_data['home_team_name'] = analysis_home_name
+        results_data['away_team_name'] = analysis_away_name
+        results_data['home_team_id'] = analysis_home_id
+        results_data['away_team_id'] = analysis_away_id
+        # Store these for potential future use or debugging
+        results_data['home_team_country'] = analysis_home_country 
+        results_data['away_team_country'] = analysis_away_country
+
+    except Exception as e:
+         print(f"❌ Error getting team IDs: {e}"); return results_data
+
+    # --- Fetch ALL Tournament/Season data for both teams ---
+    home_all_tournaments = fetch_tournaments_and_seasons_s1(analysis_home_id, analysis_home_name)
+    away_all_tournaments = fetch_tournaments_and_seasons_s1(analysis_away_id, analysis_away_name)
+    if not home_all_tournaments or not away_all_tournaments:
+        print(f"❌ Failed to retrieve ALL tournament data for one/both teams. Cannot proceed."); return results_data
+
+
+    # --- Get Statistics based on Classification Choice ---
+    # Pass the actual country of the team derived from its ID search
+    home_stats = _get_stats_based_on_classification(analysis_home_id, analysis_home_name, home_all_tournaments, scheduled_match_context_info, classification_choice, part_choice, analysis_home_country)
+    away_stats = _get_stats_based_on_classification(analysis_away_id, analysis_away_name, away_all_tournaments, scheduled_match_context_info, classification_choice, part_choice, analysis_away_country)
+
+    if not home_stats or not away_stats or home_stats.get("matches", 0) == 0 or away_stats.get("matches", 0) == 0:
+        print(f"❌ Failed to fetch stats or one/both teams had 0 matches in the selected season(s) ({analysis_home_name} vs {analysis_away_name}). Cannot calculate.")
+        results_data['context'] = f"Stat collection failed (C{classification_choice}P{part_choice})."
+        return results_data
+
+    results_data['detailed_home_stats'] = home_stats
+    results_data['detailed_away_stats'] = away_stats
+    results_data['context'] = f"C{classification_choice}P{part_choice}: H[{home_stats.get('_classification_context', 'N/A')}] vs A[{away_stats.get('_classification_context', 'N/A')}]"
+
+
+    # --- Primary Calculations (Mode 1 Logic) ---
+    final_home_xg = calculate_primary_expected_goals_s1(home_stats, away_stats)
+    final_away_xg = calculate_primary_expected_goals_s1(away_stats, home_stats)
+    final_home_corners, final_away_corners = calculate_primary_expected_corners_s1(home_stats, away_stats, final_home_xg, final_away_xg)
+    final_home_yellows = calculate_primary_expected_yellow_cards_s1(home_stats, final_away_xg)
+    final_away_yellows = calculate_primary_expected_yellow_cards_s1(away_stats, final_home_xg)
+
+    # --- S1's embedded S2-like calculations for the table (Mode 1 Logic) ---
+    xg1_m2 = calc2_adjust_xg_with_corners_s1(final_home_xg, final_home_corners)
+    xg2_m2 = calc2_adjust_xg_with_corners_s1(final_away_xg, final_away_corners)
+    match_goals_m1 = calc2_match_avg_goals_s1(final_home_xg, final_away_xg)
+    match_goals_m2 = calc2_match_avg_goals_s1(xg1_m2, xg2_m2)
+    match_goals_avg = calc2_calculate_average_s1(match_goals_m1, match_goals_m2)
+
+    fh1_m1, sh1_m1 = calc2_half_goals_s1(final_home_xg); fh2_m1, sh2_m1 = calc2_half_goals_s1(final_away_xg)
+    fh1_m2, sh1_m2 = calc2_half_goals_s1(xg1_m2); fh2_m2, sh2_m2 = calc2_half_goals_s1(xg2_m2)
+
+    first_half_avg_m1 = calc2_match_avg_goals_s1(fh1_m1, fh2_m1); first_half_avg_m2 = calc2_match_avg_goals_s1(fh1_m2, fh2_m2)
+    first_half_avg_avg = calc2_calculate_average_s1(first_half_avg_m1, first_half_avg_m2)
+    second_half_avg_m1 = calc2_match_avg_goals_s1(sh1_m1, sh2_m1); second_half_avg_m2 = calc2_match_avg_goals_s1(sh1_m2, sh2_m2)
+    second_half_avg_avg = calc2_calculate_average_s1(second_half_avg_m1, second_half_avg_m2)
+
+    btts_m1 = calc2_both_teams_to_score_s1(final_home_xg, final_away_xg); btts_m2 = calc2_both_teams_to_score_s1(xg1_m2, xg2_m2)
+    btts_avg = calc2_calculate_average_s1(btts_m1, btts_m2, precision=2)
+
+    cs1_m1 = calc2_clean_sheet_percentage_s1(final_away_xg, btts_m1); cs2_m1 = calc2_clean_sheet_percentage_s1(final_home_xg, btts_m1)
+    cs1_m2 = calc2_clean_sheet_percentage_s1(xg2_m2, btts_m2); cs2_m2 = calc2_clean_sheet_percentage_s1(xg1_m2, btts_m2)
+    cs1_avg = calc2_calculate_average_s1(cs1_m1, cs1_m2, precision=2); cs2_avg = calc2_calculate_average_s1(cs2_m1, cs2_m2, precision=2)
+
+    h1_m1, h2_m1, match_h_m1 = calc2_calculate_handicap_s1(final_home_xg, final_away_xg)
+    h1_m2, h2_m2, match_h_m2 = calc2_calculate_handicap_s1(xg1_m2, xg2_m2)
+    h1_avg = calc2_calculate_average_s1(h1_m1, h1_m2)
+    h2_avg = calc2_calculate_average_s1(h2_m1, h2_m2)
+    match_h_avg = calc2_calculate_average_s1(match_h_m1, match_h_m2)
+
+    results_data['final_home_xg'] = final_home_xg
+    results_data['final_away_xg'] = final_away_xg
+    results_data['final_home_corners'] = final_home_corners
+    results_data['final_away_corners'] = final_away_corners
+    results_data['final_home_yellows'] = final_home_yellows
+    results_data['final_away_yellows'] = final_away_yellows
+    results_data['xg1_m2'] = xg1_m2
+    results_data['xg2_m2'] = xg2_m2
+    results_data['match_goals_m1'] = match_goals_m1
+    results_data['match_goals_m2'] = match_goals_m2
+    results_data['match_goals_avg'] = match_goals_avg
+    results_data['fh1_m1'], results_data['sh1_m1'] = fh1_m1, sh1_m1
+    results_data['fh2_m1'], results_data['sh2_m1'] = fh2_m1, sh2_m1
+    results_data['fh1_m2'], results_data['sh1_m2'] = fh1_m2, sh1_m2
+    results_data['fh2_m2'], results_data['sh2_m2'] = fh2_m2, sh2_m2
+    results_data['first_half_avg_m1'] = first_half_avg_m1
+    results_data['first_half_avg_m2'] = first_half_avg_m2
+    results_data['first_half_avg_avg'] = first_half_avg_avg
+    results_data['second_half_avg_m1'] = second_half_avg_m1
+    results_data['second_half_avg_m2'] = second_half_avg_m2
+    results_data['second_half_avg_avg'] = second_half_avg_avg
+    results_data['btts_m1'] = btts_m1
+    results_data['btts_m2'] = btts_m2
+    results_data['btts_avg'] = btts_avg
+    results_data['cs1_m1'], results_data['cs2_m1'] = cs1_m1, cs2_m1
+    results_data['cs1_m2'], results_data['cs2_m2'] = cs1_m2, cs2_m2
+    results_data['cs1_avg'], results_data['cs2_avg'] = cs1_avg, cs2_avg
+    results_data['h1_m1'], results_data['h2_m1'], results_data['match_h_m1'] = h1_m1, h2_m1, match_h_m1
+    results_data['h1_m2'], results_data['h2_m2'], results_data['match_h_m2'] = h1_m2, h2_m2, match_h_m2
+    results_data['h1_avg'], results_data['h2_avg'], results_data['match_h_avg'] = h1_avg, h2_avg, match_h_avg
+    results_data['context'] = results_data.get('context', 'N/A Context') # Keep the context set by _get_stats_based_on_classification
+    results_data['calculation_successful'] = True
+
+    display_script1_results_simplified(results_data, display_label)
+
+    return results_data
+
+def _prepare_analysis_inputs_for_match_reversed_roles(scheduled_home_team_name: str, scheduled_away_team_name: str, display_label: str, scheduled_match_context_info: Dict[str, Any], classification_choice: int, part_choice: int) -> Dict[str, Any]:
+    """
+    Takes SCHEDULED HOME and AWAY team names. Finds IDs, automatically selects season (Mode 1 logic),
+    fetches stats, and calculates primary results.
+    CRITICALLY: Maps the SCHEDULED AWAY team to be the ANALYSIS HOME team (Team 1)
+    and the SCHEDULED HOME team to be the ANALYSIS AWAY team (Team 2) for all results_data fields.
+    Now uses classification_choice and part_choice for stat fetching.
+    """
+    print(f"\n--- SECTION 1: Preparing Analysis Data for {display_label} ---")
+    print(f"Scheduled Match: 🏠 {scheduled_home_team_name} vs ✈️ {scheduled_away_team_name}")
+    print(f"Analysis Roles:  🏠 {scheduled_away_team_name} vs ✈️ {scheduled_home_team_name} (REVERSED ROLES)")
+    print(f"Stat Classification: C{classification_choice} P{part_choice}")
+
+
+    results_data: Dict[str, Any] = {'calculation_successful': False}
+
+    # --- Get Team Names & IDs (Swapping Roles for Analysis) ---
+    try:
+        # **ROLE REVERSAL:**
+        # Get ID for the SCHEDULED AWAY team -> This is the ANALYSIS HOME team (Team 1)
+        analysis_home_id, analysis_home_name, analysis_home_country = get_team_id_s1(scheduled_away_team_name)
+        if not analysis_home_id: raise Exception(f"Failed to get Analysis HOME team ID for scheduled away team '{scheduled_away_team_name}'.")
+
+        # Get ID for the SCHEDULED HOME team -> This is the ANALYSIS AWAY team (Team 2)
+        analysis_away_id, analysis_away_name, analysis_away_country = get_team_id_s1(scheduled_home_team_name)
+        if not analysis_away_id: raise Exception(f"Failed to get Analysis AWAY team ID for scheduled home team '{scheduled_home_team_name}'.")
+
+        results_data['home_team_name'] = analysis_home_name
+        results_data['away_team_name'] = analysis_away_name
+        results_data['home_team_id'] = analysis_home_id
+        results_data['away_team_id'] = analysis_away_id
+        # Store these for potential future use or debugging
+        results_data['home_team_country'] = analysis_home_country 
+        results_data['away_team_country'] = analysis_away_country
+
+    except Exception as e:
+         print(f"❌ Error getting team IDs: {e}"); return results_data
+
+    # --- Fetch ALL Tournament/Season data ---
+    home_all_tournaments = fetch_tournaments_and_seasons_s1(analysis_home_id, analysis_home_name)
+    away_all_tournaments = fetch_tournaments_and_seasons_s1(analysis_away_id, analysis_away_name)
+    if not home_all_tournaments or not away_all_tournaments:
+        print(f"❌ Failed to retrieve ALL tournament data for one/both teams. Cannot proceed."); return results_data
+
+
+    # --- Get Statistics based on Classification Choice ---
+    # Pass the actual country of the team derived from its ID search
+    home_stats = _get_stats_based_on_classification(analysis_home_id, analysis_home_name, home_all_tournaments, scheduled_match_context_info, classification_choice, part_choice, analysis_home_country)
+    away_stats = _get_stats_based_on_classification(analysis_away_id, analysis_away_name, away_all_tournaments, scheduled_match_context_info, classification_choice, part_choice, analysis_away_country)
+
+    if not home_stats or not away_stats or home_stats.get("matches", 0) == 0 or away_stats.get("matches", 0) == 0:
+        print(f"❌ Failed to fetch stats or one/both teams had 0 matches in the selected season(s) ({analysis_home_name} vs {analysis_away_name}). Cannot calculate.")
+        results_data['context'] = f"Stat collection failed (C{classification_choice}P{part_choice})."
+        return results_data
+
+    results_data['detailed_home_stats'] = home_stats
+    results_data['detailed_away_stats'] = away_stats
+    results_data['context'] = f"C{classification_choice}P{part_choice}: H[{home_stats.get('_classification_context', 'N/A')}] vs A[{away_stats.get('_classification_context', 'N/A')}]"
+
+
+    # --- Primary Calculations (Mode 1 Logic) ---
+    final_home_xg = calculate_primary_expected_goals_s1(home_stats, away_stats)
+    final_away_xg = calculate_primary_expected_goals_s1(away_stats, home_stats)
+    final_home_corners, final_away_corners = calculate_primary_expected_corners_s1(home_stats, away_stats, final_home_xg, final_away_xg)
+    final_home_yellows = calculate_primary_expected_yellow_cards_s1(home_stats, final_away_xg)
+    final_away_yellows = calculate_primary_expected_yellow_cards_s1(away_stats, final_home_xg)
+
+    # --- S1's embedded S2-like calculations for the table (Mode 1 Logic) ---
+    xg1_m2 = calc2_adjust_xg_with_corners_s1(final_home_xg, final_home_corners)
+    xg2_m2 = calc2_adjust_xg_with_corners_s1(final_away_xg, final_away_corners)
+    match_goals_m1 = calc2_match_avg_goals_s1(final_home_xg, final_away_xg)
+    match_goals_m2 = calc2_match_avg_goals_s1(xg1_m2, xg2_m2)
+    match_goals_avg = calc2_calculate_average_s1(match_goals_m1, match_goals_m2)
+
+    fh1_m1, sh1_m1 = calc2_half_goals_s1(final_home_xg); fh2_m1, sh2_m1 = calc2_half_goals_s1(final_away_xg)
+    fh1_m2, sh1_m2 = calc2_half_goals_s1(xg1_m2); fh2_m2, sh2_m2 = calc2_half_goals_s1(xg2_m2)
+
+    first_half_avg_m1 = calc2_match_avg_goals_s1(fh1_m1, fh2_m1); first_half_avg_m2 = calc2_match_avg_goals_s1(fh1_m2, fh2_m2)
+    first_half_avg_avg = calc2_calculate_average_s1(first_half_avg_m1, first_half_avg_m2)
+    second_half_avg_m1 = calc2_match_avg_goals_s1(sh1_m1, sh2_m1); second_half_avg_m2 = calc2_match_avg_goals_s1(sh1_m2, sh2_m2)
+    second_half_avg_avg = calc2_calculate_average_s1(second_half_avg_m1, second_half_avg_m2)
+
+    btts_m1 = calc2_both_teams_to_score_s1(final_home_xg, final_away_xg); btts_m2 = calc2_both_teams_to_score_s1(xg1_m2, xg2_m2)
+    btts_avg = calc2_calculate_average_s1(btts_m1, btts_m2, precision=2)
+
+    cs1_m1 = calc2_clean_sheet_percentage_s1(final_away_xg, btts_m1); cs2_m1 = calc2_clean_sheet_percentage_s1(final_home_xg, btts_m1)
+    cs1_m2 = calc2_clean_sheet_percentage_s1(xg2_m2, btts_m2); cs2_m2 = calc2_clean_sheet_percentage_s1(xg1_m2, btts_m2)
+    cs1_avg = calc2_calculate_average_s1(cs1_m1, cs1_m2, precision=2); cs2_avg = calc2_calculate_average_s1(cs2_m1, cs2_m2, precision=2)
+
+    h1_m1, h2_m1, match_h_m1 = calc2_calculate_handicap_s1(final_home_xg, final_away_xg)
+    h1_m2, h2_m2, match_h_m2 = calc2_calculate_handicap_s1(xg1_m2, xg2_m2)
+    h1_avg = calc2_calculate_average_s1(h1_m1, h1_m2)
+    h2_avg = calc2_calculate_average_s1(h2_m1, h2_m2)
+    match_h_avg = calc2_calculate_average_s1(match_h_m1, match_h_m2)
+
+    results_data['final_home_xg'] = final_home_xg
+    results_data['final_away_xg'] = final_away_xg
+    results_data['final_home_corners'] = final_home_corners
+    results_data['final_away_corners'] = final_away_corners
+    results_data['final_home_yellows'] = final_home_yellows
+    results_data['final_away_yellows'] = final_away_yellows
+    results_data['xg1_m2'] = xg1_m2
+    results_data['xg2_m2'] = xg2_m2
+    results_data['match_goals_m1'] = match_goals_m1
+    results_data['match_goals_m2'] = match_goals_m2
+    results_data['match_goals_avg'] = match_goals_avg
+    results_data['fh1_m1'], results_data['sh1_m1'] = fh1_m1, sh1_m1
+    results_data['fh2_m1'], results_data['sh2_m1'] = fh2_m1, sh2_m1
+    results_data['fh1_m2'], results_data['sh1_m2'] = fh1_m2, sh1_m2
+    results_data['fh2_m2'], results_data['sh2_m2'] = fh2_m2, sh2_m2
+    results_data['first_half_avg_m1'] = first_half_avg_m1
+    results_data['first_half_avg_m2'] = first_half_avg_m2
+    results_data['first_half_avg_avg'] = first_half_avg_avg
+    results_data['second_half_avg_m1'] = second_half_avg_m1
+    results_data['second_half_avg_m2'] = second_half_avg_m2
+    results_data['second_half_avg_avg'] = second_half_avg_avg
+    results_data['btts_m1'] = btts_m1
+    results_data['btts_m2'] = btts_m2
+    results_data['btts_avg'] = btts_avg
+    results_data['cs1_m1'], results_data['cs2_m1'] = cs1_m1, cs2_m1
+    results_data['cs1_m2'], results_data['cs2_m2'] = cs1_m2, cs2_m2
+    results_data['cs1_avg'], results_data['cs2_avg'] = cs1_avg, cs2_avg
+    results_data['h1_m1'], results_data['h2_m1'], results_data['match_h_m1'] = h1_m1, h2_m1, match_h_m1
+    results_data['h1_m2'], results_data['h2_m2'], results_data['match_h_m2'] = h1_m2, h2_m2, match_h_m2
+    results_data['h1_avg'], results_data['h2_avg'], results_data['match_h_avg'] = h1_avg, h2_avg, match_h_avg
+    results_data['context'] = results_data.get('context', 'N/A Context') # Keep the context set by _get_stats_based_on_classification
+    results_data['calculation_successful'] = True
+
+    display_script1_results_simplified(results_data, display_label)
+
+    return results_data
+
+def display_script1_results_simplified(results_data: Dict[str, Any], analysis_type_label: str):
+    """
+    Displays specific primary and averaged results from Section 1's output logic in a simplified vertical format.
+    Includes an analysis_type_label to distinguish between original and reversed roles.
+    """
+    print(f"\n--- SECTION 1: Primary Analysis Metrics ({analysis_type_label}) ---")
+    print(f"--- القسم 1: مقاييس التحليل الأولية ({analysis_type_label}) ---")
+    if not results_data or not results_data.get('calculation_successful', False):
+        print("No results to display from Section 1.")
+        print("لا توجد نتائج لعرضها من القسم 1.")
+        print("="*70)
+        return
+
+    home_name = results_data.get('home_team_name', 'Analysis Home Team')
+    away_name = results_data.get('away_team_name', 'Analysis Away Team')
+    context_str = results_data.get('context', 'N/A Context')
+
+    print(f"Analysis Match: 🏠 {home_name} vs ✈️ {away_name}")
+    print(f"Data Source Context: {context_str}")
+    print("-" * 70)
+
+    # Display the fixed primary metrics
+    print(f"xG Used - {home_name} (Primary)            : {results_data.get('final_home_xg', 0.0):.2f}")
+    print(f"xG Used - {away_name} (Primary)            : {results_data.get('final_away_xg', 0.0):.2f}")
+    print(f"xG Adjusted by Corners - {home_name}     : {results_data.get('xg1_m2', 0.0):.2f}")
+    print(f"xG Adjusted by Corners - {away_name}     : {results_data.get('xg2_m2', 0.0):.2f}")
+    print("-" * 70)
+    print(f"Match Goal Avg (Overall)            : {results_data.get('match_goals_avg', 0.0):.2f}")
+    print("-" * 70)
+    print(f"Exp. Goals 1st Half (Match Avg)     : {results_data.get('first_half_avg_avg', 0.0):.2f}")
+    print(f"Exp. Goals 2nd Half (Match Avg)     : {results_data.get('second_half_avg_avg', 0.0):.2f}")
+    print("-" * 70)
+    print(f"Both Teams To Score (BTTS) %        : {results_data.get('btts_avg', 0.0):.2f}%")
+    print("-" * 70)
+    print(f"Calculated Handicap - {home_name} (Avg)  : {results_data.get('h1_avg', 0.0):.2f}")
+    print(f"Calculated Handicap - {away_name} (Avg)  : {results_data.get('h2_avg', 0.0):.2f}")
+    print(f"Match Handicap (Overall Avg)        : {results_data.get('match_h_avg', 0.0):.2f}")
+    print("-" * 70)
+    print(f"SofaScore Predicted Yellows - {home_name}: {results_data.get('final_home_yellows', 0.0):.2f}")
+    print(f"SofaScore Predicted Yellows - {away_name}: {results_data.get('final_away_yellows', 0.0):.2f}")
+    
+    print("="*70)
+
+
+# ===============================================
+# SECTION 2: Complex Calculations & Simulations
+# Refactored to be callable and return results
+# ===============================================
+
+def poisson_pmf_s2(k: int, lambda_val: float) -> float:
+    """
+    Calculates the Poisson probability mass function P(k; lambda).
+    Used by Logic Path 1. Added epsilon check for lambda_val near zero.
+    """
+    if k < 0 or not isinstance(k, int): return 0.0
+    effective_lambda = max(0.0, float(lambda_val) if isinstance(lambda_val, (int, float)) else 0.0)
+    epsilon = sys.float_info.epsilon * 100.0
+
+    if effective_lambda < epsilon: return 1.0 if k == 0 else 0.0
+
+
+    try:
+        if k > 170: # Avoid Overflow for large k in factorial, use log-gamma
+             log_prob = k * math.log(effective_lambda) - effective_lambda - math.lgamma(k + 1)
+             prob = math.exp(log_prob)
+        else:
+             prob = (effective_lambda**k) * math.exp(-effective_lambda) / math.factorial(k)
+
+        return max(prob, 1e-300) # Minimum non-zero value
+
+    except OverflowError: return 1e-300
+    except ValueError: return 0.0
+    except Exception: return 0.0
+
+
+def determine_range_based_on_absolute_value_s2(value: float) -> List[int]:
+    """
+    تطبق القاعدة المفصلة لتحديد نطاق القيم (أهداف أو فوارق) بناءً على القيمة المطلقة
+    للمدخل وجزئها الكسري. Used by Logic Path 2. Added epsilon for comparison.
+    """
+    abs_value = abs(float(value) if isinstance(value, (int, float)) else 0.0)
+
+    epsilon = sys.float_info.epsilon * 100.0
+
+    if abs_value >= 0.0 and abs_value < 0.1 - epsilon: result = [0, 1]
+    elif abs_value >= 0.1 - epsilon and abs_value < 0.4 - epsilon: result = [0, 1, 2]
+    elif abs_value >= 0.4 - epsilon and abs_value < 0.7 - epsilon: result = [0, 1, 2]
+    elif abs_value >= 0.7 - epsilon and abs_value < 1.0 - epsilon: result = [0, 1, 2]
+    else:
+        n = math.floor(abs_value); frac = abs_value - n
+        base_range_raw = [int(n-1), int(n), int(n+1)]
+        base_range = [max(0, val) for val in base_range_raw]
+
+        if frac >= 0.0 and frac < 0.1 - epsilon: result = base_range
+        elif frac >= 0.1 - epsilon and frac < 0.4 - epsilon: result = base_range
+        elif frac >= 0.4 - epsilon and frac < 0.7 - epsilon: result = base_range + [max(0, int(n+2))]
+        else: result = [max(0, int(n)), max(0, int(n+1)), max(0, int(n+2))]
+
+    return sorted(list(set([int(val) for val in result if val >= 0])))
+
+
+def get_possible_goals_individual_range_s2(value: float) -> List[int]:
+    """تحدد الأهداف المحتملة للفريق باستخدام القاعدة المعتمدة على القيمة المطلقة. Used by Logic Path 2."""
+    return determine_range_based_on_absolute_value_s2(value)
+
+def get_possible_differences_s2(diff: float) -> List[int]:
+    """تحدد الفوارق المحتملة للمباراة باستخدام القاعدة المعتمدة على القيمة المطلقة للفارق. Used by Logic Path 2."""
+    return determine_range_based_on_absolute_value_s2(diff)
+
+
+def adjust_results_s2(results: List[Tuple[int, int]], missing_diff: int) -> List[Tuple[int, int]]:
+    """تعديل النتائج الأولية لإضافة قيمة الفارق المفقود. Used by Logic Path 2."""
+    adjusted: List[Tuple[int, int]] = []
+
+    missing_diff_int = max(0, int(missing_diff))
+
+    for g1, g2 in results:
+        if g1 > g2: adjusted.append((g1, max(0, g2 + missing_diff_int)))
+        elif g2 > g1: adjusted.append((max(0, g1 + missing_diff_int), g2))
+        else: adjusted.append((g1, max(0, g2 + missing_diff_int)))
+
+    seen = set()
+    unique_adjusted = []
+    for item in adjusted:
+        valid_item_tuple = (max(0, int(item[0])), max(0, int(item[1])))
+        if valid_item_tuple not in seen:
+            seen.add(valid_item_tuple)
+            unique_adjusted.append(valid_item_tuple)
+
+    return sorted(unique_adjusted)
+
+
+# --- Calculation of Weights (DIFFERENT implementations for each logic path) ---
+
+def calculate_s1_weights_s2(results: List[Tuple[int, int]], xg1: float, xg2: float, external_factor_1: float, external_factor_2: float, current_sim_sensitivity: float) -> List[float]:
+    """
+    Calculates weights for each result by combining Poisson probabilities (from new_xg)
+    and the influence of External Factors. Used by Logic Path 1. Added epsilon checks.
+    """
+    weights = []
+
+    effective_xg1 = max(0.0, float(xg1) if isinstance(xg1, (int, float)) else 0.0)
+    effective_xg2 = max(0.0, float(xg2) if isinstance(xg2, (int, float)) else 0.0)
+
+    epsilon_sensitivity = sys.float_info.epsilon * 100.0
+    sensitivity_zero = abs(float(current_sim_sensitivity)) < epsilon_sensitivity if isinstance(current_sim_sensitivity, (int, float)) else True
+
+
+    for g1, g2 in results:
+        try:
+            poisson_prob = poisson_pmf_s2(max(0, int(g1)), effective_xg1) * poisson_pmf_s2(max(0, int(g2)), effective_xg2)
+
+            if poisson_prob < 1e-300: poisson_prob = 1e-300
+
+            bias_contribution = (float(g1) * float(external_factor_1)) + (float(g2) * float(external_factor_2)) if isinstance(g1, (int, float)) and isinstance(g2, (int, float)) and isinstance(external_factor_1, (int, float)) and isinstance(external_factor_2, (int, float)) else 0.0
+
+            if sensitivity_zero: external_influence = 1.0
+            else:
+                argument = float(current_sim_sensitivity) * bias_contribution
+                argument = min(709.0, max(-745.0, argument)) # Clamp to prevent overflow in exp
+                try: external_influence = math.exp(argument)
+                except OverflowError: external_influence = float('inf') if argument > 0 else 1e-300
+                except Exception: external_influence = 1.0
+
+            combined_weight = float(poisson_prob) * float(external_influence)
+
+            weights.append(max(combined_weight, 1e-300))
+
+        except Exception: weights.append(1e-300)
+
+    weights_sum = sum(weights)
+
+    epsilon_sum = sys.float_info.epsilon * len(weights) * 100.0
+
+    inf_weights_count = sum(math.isinf(w) and w > 0 for w in weights)
+
+    if inf_weights_count == len(weights): return [1.0] * len(results)
+    elif math.isnan(weights_sum) or weights_sum <= epsilon_sum or inf_weights_count > 0:
+         valid_finite_weights = [w for w in weights if math.isfinite(w) and w > 1e-300]
+         if not valid_finite_weights: return [1.0] * len(results)
+         return weights # Return as is, let sum handle normalization if possible later
+    else: return weights
+
+
+def calculate_s2_weights_s2(results: List[Tuple[int, int]], external_factor_1: float, external_factor_2: float, current_sim_sensitivity: float) -> List[float]:
+    """
+    Calculates weights for each result based ONLY on the influence of External Factors.
+    Used by Logic Path 2. Added epsilon checks.
+    """
+    weights = []
+
+    epsilon_sensitivity = sys.float_info.epsilon * 100.0
+    sensitivity_zero = abs(float(current_sim_sensitivity)) < epsilon_sensitivity if isinstance(current_sim_sensitivity, (int, float)) else True
+
+    if sensitivity_zero: return [1.0] * len(results)
+
+    for g1, g2 in results:
+        bias_contribution = (float(g1) * float(external_factor_1)) + (float(g2) * float(external_factor_2)) if isinstance(g1, (int, float)) and isinstance(g2, (int, float)) and isinstance(external_factor_1, (int, float)) and isinstance(external_factor_2, (int, float)) else 0.0
+        try:
+             argument = float(current_sim_sensitivity) * bias_contribution
+             argument = min(709.0, max(-745.0, argument)) # Clamp to prevent overflow in exp
+             weight = math.exp(argument)
+        except OverflowError: weight = float('inf') if argument > 0 else 1e-300
+        except Exception: weight = 1.0
+
+        weights.append(max(weight, 1e-300))
+
+    weights_sum = sum(weights)
+    epsilon_sum = sys.float_info.epsilon * len(weights) * 100.0
+
+    inf_weights_count = sum(math.isinf(w) and w > 0 for w in weights)
+    if inf_weights_count == len(weights): return [1.0] * len(results)
+    elif weights_sum <= epsilon_sum or math.isnan(weights_sum) or inf_weights_count > 0:
+         valid_finite_weights = [w for w in weights if math.isfinite(w) and w > 1e-300]
+         if not valid_finite_weights: return [1.0] * len(results)
+         return weights
+    else: return weights
+
+
+# --- Common Simulation and Complex Rule Functions ---
+
+def calculate_team_factor_s2(handicap: float, smaller_num: float, larger_num: float) -> float:
+    """
+    Calculates the external factor for a single team based on two input numbers
+    and the team's handicap value. (Common to both original scripts' logic).
+    Used in the main orchestrator to calculate factors. Added epsilon for comparison.
+    """
+    try:
+        handicap_f = float(handicap) if isinstance(handicap, (int, float)) else 0.0
+        smaller_num_f = float(smaller_num) if isinstance(smaller_num, (int, float)) else 0.0
+        larger_num_f = float(larger_num) if isinstance(larger_num, (int, float)) else 0.0
+
+        epsilon = sys.float_info.epsilon * 100.0
+
+        if smaller_num_f > larger_num_f:
+             smaller_num_f, larger_num_f = larger_num_f, smaller_num_f
+
+        if abs(larger_num_f) < epsilon: return 0.0
+
+        ratio_A = smaller_num_f / larger_num_f
+
+        average_sum_half = (smaller_num_f + larger_num_f) / 2.0
+        value_B = average_sum_half * handicap_f
+
+        calculated_factor = ratio_A * value_B
+
+        return calculated_factor
+
+    except Exception: return 0.0
+
+
+def run_simulations_for_percentages_s2(results: List[Tuple[int, int]], weights: List[float], num_rounds: int, trials_per_round: int, label: str, sim_seed: int) -> Dict[Tuple[int, int], float]:
+    """
+    Runs simulations using provided weights for each result over multiple rounds with a specific seed.
+    Returns a dictionary of results with their rounded percentages (0-100).
+    Ensures all input results are present in the output dict. Added epsilon for weights check.
+    """
+    total_trials = num_rounds * trials_per_round
+    round_total_counts = Counter()
+
+    if not results or not weights or len(results) != len(weights): return {result: 0.0 for result in results} if results else {}
+
+    epsilon_weights_sum = sys.float_info.epsilon * len(weights) * 100.0
+
+    weights_sum = sum(weights)
+
+    finite_positive_weights = [w for w in weights if math.isfinite(w) and w > 1e-300]
+    if not finite_positive_weights and not any(math.isinf(w) and w > 0 for w in weights): return {result: 0.0 for result in results}
+    elif math.isnan(weights_sum) or weights_sum < 0:
+         if results: return {result: 100.0 / len(results) for result in results} # Default to even distribution if sum is problematic
+         else: return {}
+
+    random.seed(sim_seed)
+
+    try:
+        choices = results
+        sim_weights_to_use = weights
+
+        for i in range(num_rounds):
+            try:
+                if trials_per_round == 1:
+                    if not choices: break
+                    # Ensure choices and weights are valid for random.choices
+                    if not sim_weights_to_use or not any(w > 0 for w in sim_weights_to_use):
+                        # Fallback to uniform if weights are all zero/negative
+                        round_results = random.choices(choices, k=1)
+                    else:
+                        round_results = random.choices(choices, weights=sim_weights_to_use, k=1)
+                elif trials_per_round > 1:
+                     if not choices: break
+                     if not sim_weights_to_use or not any(w > 0 for w in sim_weights_to_use):
+                        round_results = random.choices(choices, k=trials_per_round)
+                     else:
+                        round_results = random.choices(choices, weights=sim_weights_to_use, k=trials_per_round)
+                else: round_results = []
+                round_total_counts.update(round_results)
+            except ValueError as e: print(f"  Warning ({label}): ValueError during random.choices round {i+1}: {e}. Skipping round."); break
+            except IndexError as e: print(f"  Warning ({label}): IndexError during random.choices round {i+1}: {e}. Skipping round."); break
+            except Exception as e: print(f"  Warning ({label}): Unexpected error during simulation round {i+1}: {e}. Skipping round."); break
+
+        percentages: Dict[Tuple[int, int], float] = {}
+        if total_trials > 0 and round_total_counts:
+             for result in results: percentages[result] = round((round_total_counts.get(result, 0) / total_trials) * 100.0, 5)
+        else: percentages = {result: 0.0 for result in results}
+
+        for result in results: percentages.setdefault(result, 0.0)
+
+        return percentages
+
+    except Exception as e:
+        print(f"\n  An unexpected error occurred during simulation setup/outer loop ({label}): {e}")
+        return {result: 0.0 for result in results} if results else {}
+
+
+def apply_complex_rule_s2(combined_value: float) -> float | None:
+    """
+    Performs the complex calculations from the original scripts on a given combined value.
+    This value is typically the sqrt of the product of simulation percentages.
+    Returns the final calculated number from the rule. Returns None or 0.0 on failure.
+    Added epsilon for comparisons.
+    """
+    try:
+        input_val = float(combined_value) if isinstance(combined_value, (int, float)) else 0.0
+
+        epsilon_rule = 1e-9
+        if input_val < epsilon_rule: return 0.0
+
+        input_number_str_precise = repr(input_val)
+
+        integer_part = int(max(0, math.floor(input_val)))
+
+        decimal_pos = input_number_str_precise.find('.')
+        frac_digits_str_full = ""
+        if decimal_pos != -1:
+             frac_part_raw = input_number_str_precise[decimal_pos + 1:]
+             e_pos = frac_part_raw.lower().find('e')
+             if e_pos != -1: frac_digits_str_full = frac_part_raw[:e_pos]
+             else: frac_digits_str_full = frac_part_raw
+             frac_digits_str_full = ''.join(filter(str.isdigit, frac_digits_str_full))
+
+        frac_digits_for_AB_int_str = frac_digits_str_full[:6]
+
+        fractional_part_as_int_for_AB = 0
+        if frac_digits_for_AB_int_str:
+             try: fractional_part_as_int_for_AB = int(frac_digits_for_AB_int_str)
+             except ValueError: return 0.0
+
+        padded_frac_digits_for_C = frac_digits_str_full.ljust(6, '0')
+        if len(padded_frac_digits_for_C) > 6: padded_frac_digits_for_C = padded_frac_digits_for_C[:6]
+
+        first_three_str = padded_frac_digits_for_C[:3]
+        last_three_str = padded_frac_digits_for_C[-3:]
+
+        try:
+            first_three_num = int(first_three_str) if first_three_str else 0
+            last_three_num = int(last_three_str) if last_three_str else 0
+        except ValueError: return 0.0
+
+        try:
+             sqrt_frac_for_AB = math.sqrt(max(0.0, fractional_part_as_int_for_AB))
+             intermediate_ab_base = sqrt_frac_for_AB * max(0.0, integer_part)
+        except Exception: return 0.0
+
+        value_a = math.sqrt(max(0.0, intermediate_ab_base)) * 0.1
+
+        epsilon_cubic_base = sys.float_info.epsilon * 100.0
+        if abs(intermediate_ab_base) < epsilon_cubic_base: value_b = 0.0
+        else: value_b = math.pow(max(0.0, intermediate_ab_base), 1/3)
+
+        try:
+            c_part1_intermediate = first_three_num * last_three_num
+            sqrt_c_part1 = math.sqrt(max(0.0, c_part1_intermediate))
+            c_part1 = sqrt_c_part1 * 0.001
+
+            sqrt_integer_part = math.sqrt(max(0.0, integer_part))
+
+            value_c = c_part1 * sqrt_integer_part
+        except Exception: return 0.0
+
+        try:
+            a_times_b_base = value_a * value_b
+            sqrt_a_times_b = math.sqrt(max(0.0, a_times_b_base))
+
+            epsilon_final_div = sys.float_info.epsilon * 100.0
+            if abs(sqrt_a_times_b) < epsilon_final_div: final_result_raw = 0.0
+            else: final_result_raw = (value_c / sqrt_a_times_b) * 100
+
+            rounded_final_result = round(final_result_raw, 3)
+
+            return rounded_final_result
+
+        except Exception: return 0.0
+
+    except Exception: return 0.0
+
+
+# --- Functions to encapsulate Logic Path 1 and Logic Path 2 ---
+
+def run_logic_path_1_s2(results_from_s1: Dict[str, Any], sim_seeds: List[int]) -> Dict[Tuple[int, int], float]:
+    """
+    Runs the core logic flow based on the first script provided, using inputs from S1 and orchestrator calcs.
+    Uses fixed grid result generation, Poisson + Factor weights.
+    Returns a dictionary: {(g1, g2): final_value_from_complex_rule}.
+    g1 = Analysis Home Goals, g2 = Analysis Away Goals.
+    """
+    new_home_xg = results_from_s1.get('new_home_xg', 0.0)
+    new_away_xg = results_from_s1.get('new_away_xg', 0.0)
+    ext_factor1 = results_from_s1.get('home_external_factor', 0.0)
+    ext_factor2 = results_from_s1.get('away_external_factor', 0.0)
+
+    max_goals_per_team = 8
+    final_candidate_results = sorted([(g1, g2) for g1 in range(max_goals_per_team + 1) for g2 in range(max_goals_per_team + 1)])
+
+    if not final_candidate_results: return {}
+
+    num_simulation_rounds = 4
+    trials_per_round = 1_000_000
+    simulation_configs = [
+        (ext_factor1, ext_factor2, "Factor1 +, Factor2 +"),
+        (-ext_factor1, -ext_factor2, "Factor1 -, Factor2 -"),
+        (-ext_factor1, ext_factor2, "Factor1 -, Factor2 +"),
+        (ext_factor1, -ext_factor2, "Factor1 +, Factor2 -"),
+    ]
+    all_percentages: List[Dict[Tuple[int, int], float]] = []
+
+    for i, (ef1_sim, ef2_sim, label) in enumerate(simulation_configs):
+        current_sim_sensitivity = (float(ef1_sim) + float(ef2_sim)) / 2.0 if isinstance(ef1_sim, (int, float)) and isinstance(ef2_sim, (int, float)) else 0.0
+
+        sim_seed = sim_seeds[i % len(sim_seeds)]
+        result_weights = calculate_s1_weights_s2(
+            final_candidate_results, new_home_xg, new_away_xg, ef1_sim, ef2_sim, current_sim_sensitivity
+        )
+
+        percentages_dict = run_simulations_for_percentages_s2(
+            final_candidate_results, result_weights, num_simulation_rounds, trials_per_round, f"Path 1 Sim {i+1}", sim_seed
+        )
+        all_percentages.append(percentages_dict)
+
+    combined_metrics: Dict[Tuple[int, int], float] = {}
+    epsilon_product = 1e-305
+
+    for result in final_candidate_results:
+        p_values = [percentages_dict.get(result, 0.0) for percentages_dict in all_percentages]
+        if any(p < epsilon_product for p in p_values): combined_value = 0.0
+        else:
+             try:
+                  log_sum_of_percentages = sum(math.log(max(epsilon_product, p)) for p in p_values)
+                  log_combined_value = 0.5 * log_sum_of_percentages
+                  combined_value = math.exp(log_combined_value)
+             except Exception: combined_value = 0.0
+
+        combined_metrics[result] = combined_value
+
+    results_with_final_value_p1: Dict[Tuple[int, int], float] = {}
+    for result, initial_combined_value in combined_metrics.items():
+        final_value = apply_complex_rule_s2(initial_combined_value)
+        if final_value is not None: results_with_final_value_p1[result] = final_value
+
+    return results_with_final_value_p1
+
+
+def run_logic_path_2_s2(results_from_s1: Dict[str, Any], sim_seeds: List[int]) -> Dict[Tuple[int, int], float]:
+    """
+    Runs the core logic flow based on the second script provided, using inputs from S1 and orchestrator calcs.
+    Uses range/adjustment result generation, Factor-only weights.
+    Returns a dictionary: {(g1, g2): final_value_from_complex_rule}.
+    g1 = Analysis Home Goals, g2 = Analysis Away Goals.
+    """
+    exp1 = results_from_s1.get('final_home_xg', 0.0)
+    exp2 = results_from_s1.get('final_away_xg', 0.0)
+    diff = results_from_s1.get('match_handicap_abs', 0.0)
+    ext_factor1 = results_from_s1.get('home_external_factor', 0.0)
+    ext_factor2 = results_from_s1.get('away_external_factor', 0.0)
+
+    goals1_individual_range = get_possible_goals_individual_range_s2(exp1)
+    goals2_individual_range = get_possible_goals_individual_range_s2(exp2)
+    valid_diffs = get_possible_differences_s2(diff)
+
+    initial_generated_matches_set = set()
+    for g1 in goals1_individual_range:
+        for g2 in goals2_individual_range: initial_generated_matches_set.add((g1, g2))
+
+    initial_generated_matches = sorted(list(initial_generated_matches_set))
+    initial_match_diffs = set(abs(g1 - g2) for g1, g2 in initial_generated_matches)
+
+    missing_diffs = [d for d in valid_diffs if d not in initial_match_diffs]
+    if missing_diffs:
+        all_adjusted_results: List[Tuple[int, int]] = []
+        for missing_diff in missing_diffs:
+             adjusted_for_this_diff = adjust_results_s2(initial_generated_matches, missing_diff)
+             all_adjusted_results.extend(adjusted_for_this_diff)
+
+        final_results_list_raw = initial_generated_matches + all_adjusted_results
+        final_candidate_results = sorted(list(set(final_results_list_raw)))
+    else: final_candidate_results = sorted(list(set(initial_generated_matches)))
+
+    if not final_candidate_results: return {}
+
+    num_simulation_rounds = 4
+    trials_per_round = 1_000_000
+    simulation_configs = [
+        (ext_factor1, ext_factor2, "Factor1 +, Factor2 +"),
+        (-ext_factor1, -ext_factor2, "Factor1 -, Factor2 -"),
+        (-ext_factor1, ext_factor2, "Factor1 -, Factor2 +"),
+        (ext_factor1, -ext_factor2, "Factor1 +, Factor2 -"),
+    ]
+    all_percentages: List[Dict[Tuple[int, int], float]] = []
+
+    for i, (ef1_sim, ef2_sim, label) in enumerate(simulation_configs):
+        current_sim_sensitivity = (float(ef1_sim) + float(ef2_sim)) / 2.0 if isinstance(ef1_sim, (int, float)) and isinstance(ef2_sim, (int, float)) else 0.0
+
+        sim_seed = sim_seeds[i % len(sim_seeds)]
+        result_weights = calculate_s2_weights_s2(final_candidate_results, ef1_sim, ef2_sim, current_sim_sensitivity)
+
+        percentages_dict = run_simulations_for_percentages_s2(
+            final_candidate_results, result_weights, num_simulation_rounds, trials_per_round, f"Path 2 Sim {i+1}", sim_seed
+        )
+        all_percentages.append(percentages_dict)
+
+    combined_metrics: Dict[Tuple[int, int], float] = {}
+    epsilon_product = 1e-305
+
+    for result in final_candidate_results:
+        p_values = [percentages_dict.get(result, 0.0) for percentages_dict in all_percentages]
+        if any(p < epsilon_product for p in p_values): combined_value = 0.0
+        else:
+             try:
+                  log_sum_of_percentages = sum(math.log(max(epsilon_product, p)) for p in p_values)
+                  log_combined_value = 0.5 * log_sum_of_percentages
+                  combined_value = math.exp(log_combined_value)
+             except Exception: combined_value = 0.0
+
+        combined_metrics[result] = combined_value
+
+    results_with_final_value_p2: Dict[Tuple[int, int], float] = {}
+    for result, initial_combined_value in combined_metrics.items():
+        final_value = apply_complex_rule_s2(initial_combined_value)
+        if final_value is not None: results_with_final_value_p2[result] = final_value
+
+    return results_with_final_value_p2
+
+
+def run_script2_analysis(results_from_s1: Dict[str, Any], analysis_type_label: str) -> Dict[Tuple[int, int], float]:
+    """ Runs the core logic based on the second script provided. """
+    if not results_from_s1 or not results_from_s1.get('calculation_successful', False):
+        return {}
+
+    master_random_seed_value = 42
+    random.seed(master_random_seed_value)
+    num_simulations_per_path = 4
+    sim_seeds = [random.getrandbits(32) for _ in range(num_simulations_per_path)]
+
+    home_xg_no_corners_orig = results_from_s1.get('final_home_xg', 0.0)
+    away_xg_no_corners_orig = results_from_s1.get('final_away_xg', 0.0)
+    home_xg_with_corners_orig = results_from_s1.get('xg1_m2', 0.0)
+    away_xg_with_corners_orig = results_from_s1.get('xg2_m2', 0.0)
+    home_handicap_avg_orig = results_from_s1.get('h1_avg', 0.0)
+    away_handicap_avg_orig = results_from_s1.get('h2_avg', 0.0)
+    match_handicap_avg_orig = results_from_s1.get('match_h_avg', 0.0)
+
+    home_xg_no_corners = round(home_xg_no_corners_orig, DECIMAL_PLACES_INPUTS_S2)
+    away_xg_no_corners = round(away_xg_no_corners_orig, DECIMAL_PLACES_INPUTS_S2)
+    home_xg_with_corners = round(home_xg_with_corners_orig, DECIMAL_PLACES_INPUTS_S2)
+    away_xg_with_corners = round(away_xg_with_corners_orig, DECIMAL_PLACES_INPUTS_S2)
+    home_handicap_avg = round(home_handicap_avg_orig, DECIMAL_PLACES_INPUTS_S2)
+    away_handicap_avg = round(away_handicap_avg_orig, DECIMAL_PLACES_INPUTS_S2)
+    match_handicap_avg = round(match_handicap_avg_orig, DECIMAL_PLACES_INPUTS_S2)
+
+    epsilon_zero_check = sys.float_info.epsilon * 100.0
+
+    # --- Calculate Home Team's Final XG for Poisson ---
+    home_larger_xg = max(home_xg_no_corners, home_xg_with_corners)
+    home_smaller_xg = min(home_xg_no_corners, home_xg_with_corners)
+
+    home_alpha = 1.0
+    if abs(home_smaller_xg) >= epsilon_zero_check:
+        try: home_alpha = home_larger_xg / home_smaller_xg
+        except (ZeroDivisionError, Exception): home_alpha = 1.0
+
+    home_beta = 0.0; home_gamma = 0.0
+    if home_handicap_avg >= -epsilon_zero_check:
+        home_beta = home_alpha + home_handicap_avg
+        home_gamma = home_alpha - home_handicap_avg
+    else:
+        home_new_handicap = home_handicap_avg - match_handicap_avg
+        home_beta = home_alpha + home_new_handicap
+        home_gamma = home_alpha - home_new_handicap
+    new_home_xg = max(0.0, (home_alpha + home_beta + home_gamma) / 3.0)
+
+
+    # --- Calculate Away Team's Final XG for Poisson ---
+    away_larger_xg = max(away_xg_no_corners, away_xg_with_corners)
+    away_smaller_xg = min(away_xg_no_corners, away_xg_with_corners)
+
+    away_alpha = 1.0
+    if abs(away_smaller_xg) >= epsilon_zero_check:
+        try: away_alpha = away_larger_xg / away_smaller_xg
+        except (ZeroDivisionError, Exception): away_alpha = 1.0
+
+    away_beta = 0.0; away_gamma = 0.0
+    if away_handicap_avg >= -epsilon_zero_check:
+        away_beta = away_alpha + away_handicap_avg
+        away_gamma = away_alpha - away_handicap_avg
+    else:
+        away_new_handicap = away_handicap_avg - match_handicap_avg
+        away_beta = away_alpha + away_new_handicap
+        away_gamma = away_alpha - away_new_handicap
+    new_away_xg = max(0.0, (away_alpha + away_beta + away_gamma) / 3.0)
+
+    results_from_s1['new_home_xg'] = new_home_xg
+    results_from_s1['new_away_xg'] = new_away_xg
+
+    h1_for_factors = home_handicap_avg
+    h2_for_factors = away_handicap_avg
+
+    if home_handicap_avg < -epsilon_zero_check or away_handicap_avg < -epsilon_zero_check:
+        if home_xg_no_corners < away_xg_no_corners:
+             h1_for_factors = -abs(home_handicap_avg)
+             h2_for_factors = abs(away_handicap_avg)
+        else:
+             h1_for_factors = abs(home_handicap_avg)
+             h2_for_factors = -abs(away_handicap_avg)
+
+    home_external_factor = calculate_team_factor_s2(handicap=h1_for_factors, smaller_num=min(home_xg_no_corners, home_xg_with_corners), larger_num=max(home_xg_no_corners, home_xg_with_corners))
+    away_external_factor = calculate_team_factor_s2(handicap=h2_for_factors, smaller_num=min(away_xg_no_corners, away_xg_with_corners), larger_num=max(away_xg_no_corners, away_xg_with_corners))
+
+    results_from_s1['home_external_factor'] = home_external_factor
+    results_from_s1['away_external_factor'] = away_external_factor
+
+    match_handicap_abs = abs(match_handicap_avg)
+    results_from_s1['match_handicap_abs'] = match_handicap_abs
+    # --- Run Logic Path 1 ---
+    s1_results_and_final_values = run_logic_path_1_s2(results_from_s1, sim_seeds)
+
+    # --- Run Logic Path 2 ---
+    s2_results_and_final_values = run_logic_path_2_s2(results_from_s1, sim_seeds)
+
+    all_unique_results = set(s1_results_and_final_values.keys()).union(s2_results_and_final_values.keys())
+
+    if not all_unique_results:
+        return {} # Return empty dict if no results
+
+    results_with_combined_percentage: List[Tuple[Tuple[int, int], float]] = []
+
+    # Process results in a consistent order (e.g., sorted)
+    sorted_unique_results = sorted(list(all_unique_results))
+
+    for result in sorted_unique_results:
+        # Get final values from each path, defaulting to 0.0 if result is missing
+        # The results tuple (g1, g2) represents (Analysis Home goals, Analysis Away goals)
+        final_value_p1 = s1_results_and_final_values.get(result, 0.0)
+        final_value_p2 = s2_results_and_final_values.get(result, 0.0)
+
+        # Ensure values are non-negative before combining
+        val1 = max(0.0, final_value_p1)
+        val2 = max(0.0, final_value_p2)
+
+        # Apply sqrt(v1*v2) combination. Result will be 0 if either v1 or v2 was 0.
+        combined_percentage = math.sqrt(val1 * val2)
+
+        # Filter out results where the final combined percentage is zero or negative (shouldn't be negative due to sqrt)
+        # Use a small tolerance for zero comparison
+        epsilon_final_percentage = 1e-9 # Keep if percentage is meaningfully positive
+        if combined_percentage > epsilon_final_percentage:
+             # Round the final combined percentage for display and storage
+             rounded_combined_percentage = round(combined_percentage, DECIMAL_PLACES_FINAL_S2)
+             results_with_combined_percentage.append((result, rounded_combined_percentage))
+
+
+    # --- Prepare Final Results Sorted by Combined Percentage for Output ---
+    final_script2_results: Dict[Tuple[int, int], float] = {}
+    if not results_with_combined_percentage:
+        pass # Will print "No results..." in the display function
+    else:
+        # Sort by the combined percentage descending. For ties, sort by the result tuple ascending.
+        sorted_final_results = sorted(
+            results_with_combined_percentage,
+            key=lambda item: (-item[1], item[0]) # Sort desc by percentage, then asc by result tuple (g1, g2)
+        )
+
+        # Populate the final dictionary
+        for result, combined_percentage in sorted_final_results:
+             final_script2_results[result] = combined_percentage
+
+    return final_script2_results # Return the dictionary of results and percentages
+
+
+def display_script2_results_formatted(script2_results: Dict[Tuple[int, int], float], analysis_data: Dict[str, Any], analysis_type_label: str):
+     """
+     Displays Script 2 final results in the requested vertical format.
+     Includes an analysis_type_label to distinguish between original and reversed roles.
+     """
+     print(f"\n--- SECTION 2: Predicted Match Results & Percentages ({analysis_type_label}) ---")
+     print(f"--- القسم 2: نتائج التوقعات مع النسب المئوية ({analysis_type_label}) ---")
+
+     if not script2_results:
+         print(f"No results with non-zero percentage from Section 2 ({analysis_type_label}).")
+         print(f"لا توجد نتائج بنسبة غير صفرية من القسم 2 ({analysis_type_label}).")
+         print("="*70)
+         return
+
+     home_name = analysis_data.get('home_team_name', 'Analysis Home Team')
+     away_name = analysis_data.get('away_team_name', 'Analysis Away Team')
+
+     sorted_script2_results = sorted(script2_results.items(), key=lambda item: item[1], reverse=True)
+
+     print(f"Predicted Scores for: 🏠 {home_name} vs ✈️ {away_name}")
+     print("-" * 70)
+
+     display_limit = 15 # Can adjust this limit
+     for i, ((g1, g2), percentage) in enumerate(sorted_script2_results[:display_limit]):
+          print(f"  {home_name} {g1} - {away_name} {g2}: {percentage:.{DECIMAL_PLACES_FINAL_S2}f}%")
+
+     if len(sorted_script2_results) > display_limit:
+          print(f"  (... and {len(sorted_script2_results) - display_limit} more results)")
+
+     print("="*70)
+
+
+# ===============================================
+# SECTION 3: Gemini API Interaction (Core Logic)
+# This is the actual API call function, now internal to the new Section 5
+# ===============================================
+
+def _send_to_gemini(prompt_text: str) -> str:
+    """
+    Sends the constructed prompt to the Gemini API.
+    Returns the generated text from the API or an error message.
+    This is the internal, actual API call function.
+    """
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_ACTUAL_GEMINI_API_KEY":
+         return "❌ Gemini API Key is missing or not updated. Cannot send request."
+
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt_text}]
+        }]
+    }
+
+    try:
+        response = requests.post(GEMINI_API_URL, headers=HEADERS_GEMINI, data=json.dumps(payload), timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        response_data = response.json()
+
+        if response_data and 'candidates' in response_data:
+            if response_data['candidates']:
+                first_candidate = response_data['candidates'][0]
+                if 'content' in first_candidate and 'parts' in first_candidate['content']:
+                    if first_candidate['content']['parts']:
+                        first_part = first_candidate['content']['parts'][0]
+                        if 'text' in first_part: return first_part['text']
+        elif 'promptFeedback' in response_data and 'blockReason' in response_data['promptFeedback']:
+             return f"❌ Prompt blocked by Gemini API. Reason: {response_data['promptFeedback']['blockReason']}"
+
+        return "❌ Empty or unexpected response from Gemini API."
+
+    except requests.exceptions.Timeout: return "❌ Request to Gemini API timed out."
+    except requests.exceptions.RequestException as e: return f"❌ Error during Gemini API request: {e}"
+    except Exception as e: return f"❌ Unexpected error during Gemini API interaction: {e}"
+
+
+# ===============================================
+# New High-Level Orchestration Pipelines
+# These mimic the "independent scripts"
+# ===============================================
+
+def run_original_roles_pipeline(scheduled_home_team_name: str, scheduled_away_team_name: str, scheduled_match_data: Dict[str, Any], classification_choice: int, part_choice: int) -> Dict[str, Any]:
+    """
+    Runs the full analysis pipeline for the match with original home/away roles.
+    Returns a dictionary containing all collected S1 data and S2 results.
+    """
+    print("\n" + "="*80)
+    print(f"⚽ RUNNING PIPELINE: Original Roles ({scheduled_home_team_name} vs {scheduled_away_team_name})")
+    print("="*80)
+
+    # Section 1: Data Preparation
+    script1_data = _prepare_analysis_inputs_for_match_original_roles(
+        scheduled_home_team_name, scheduled_away_team_name, "Original Roles", scheduled_match_data, classification_choice, part_choice
+    )
+    if not script1_data.get('calculation_successful', False):
+        script1_data['gemini_prompt_segment'] = f"Original Roles: Data preparation failed (C{classification_choice}P{part_choice})."
+        script1_data['script2_final_results'] = {} # Ensure this is empty if S1 fails
+        return script1_data
+
+    # Section 2: Complex Calculations & Simulations
+    script2_results = run_script2_analysis(script1_data, "Original Roles")
+
+    # Prepare a segment for the Gemini prompt based on this pipeline's results
+    gemini_segment = _format_gemini_prompt_segment(script1_data, script2_results, "Original Roles")
+    script1_data['gemini_prompt_segment'] = gemini_segment
+    script1_data['script2_final_results'] = script2_results # Store S2 results directly here for easy access
+
+    return script1_data
+
+def run_reversed_roles_pipeline(scheduled_home_team_name: str, scheduled_away_team_name: str, scheduled_match_data: Dict[str, Any], classification_choice: int, part_choice: int) -> Dict[str, Any]:
+    """
+    Runs the full analysis pipeline for the match with reversed home/away roles.
+    Returns a dictionary containing all collected S1 data and S2 results.
+    """
+    print("\n" + "="*80)
+    print(f"⚽ RUNNING PIPELINE: Reversed Roles ({scheduled_away_team_name} vs {scheduled_home_team_name})")
+    print("="*80)
+
+    # Section 1: Data Preparation (with roles reversed for analysis)
+    script1_data = _prepare_analysis_inputs_for_match_reversed_roles(
+        scheduled_home_team_name, scheduled_away_team_name, "Reversed Roles", scheduled_match_data, classification_choice, part_choice
+    )
+    if not script1_data.get('calculation_successful', False):
+        script1_data['gemini_prompt_segment'] = f"Reversed Roles: Data preparation failed (C{classification_choice}P{part_choice})."
+        script1_data['script2_final_results'] = {} # Ensure this is empty if S1 fails
+        return script1_data
+
+    # Section 2: Complex Calculations & Simulations
+    script2_results = run_script2_analysis(script1_data, "Reversed Roles")
+
+    # Prepare a segment for the Gemini prompt based on this pipeline's results
+    gemini_segment = _format_gemini_prompt_segment(script1_data, script2_results, "Reversed Roles")
+    script1_data['gemini_prompt_segment'] = gemini_segment
+    script1_data['script2_final_results'] = script2_results # Store S2 results directly here for easy access
+
+    return script1_data
+
+def _format_gemini_prompt_segment(sofascore_stats: Dict[str, Any], script2_results: Dict[Tuple[int, int], float], analysis_label: str) -> str:
+    """
+    Helper to format a segment of the Gemini prompt for one analysis type.
+    This function has been updated to dynamically list ALL numeric per-game averages.
+    """
+    segment_text = f"\n--- Data for {analysis_label} ---\n"
+    home_name = sofascore_stats.get('home_team_name', 'Analysis Home Team')
+    away_name = sofascore_stats.get('away_team_name', 'Analysis Away Team')
+
+    if not sofascore_stats.get('calculation_successful', False):
+        segment_text += f"Status: Failed to retrieve or calculate data for {analysis_label}. No detailed stats available.\n"
+        segment_text += "\n---\n"
+        return segment_text
+
+    segment_text += f"Match (as analyzed): 🏠 {home_name} vs ✈️ {away_name}\n"
+    segment_text += f"Data Source Context: {sofascore_stats.get('context', 'N/A')}\n"
+    segment_text += f"- {home_name} Final XG for Poisson (S2 Calc Input): {sofascore_stats.get('new_home_xg', 'N/A'):.4f}\n"
+    segment_text += f"- {away_name} Final XG for Poisson (S2 Calc Input): {sofascore_stats.get('new_away_xg', 'N/A'):.4f}\n"
+    segment_text += f"- {home_name} External Factor (S2 Calc Input): {sofascore_stats.get('home_external_factor', 'N/A'):.4f}\n"
+    segment_text += f"- {away_name} External Factor (S2 Calc Input): {sofascore_stats.get('away_external_factor', 'N/A'):.4f}\n"
+    segment_text += "-"*15 + "\n"
+    segment_text += f"- Expected Goals (xG) {home_name} (S1 Avg): {sofascore_stats.get('final_home_xg', 'N/A'):.2f}\n"
+    segment_text += f"- Expected Goals (xG) {away_name} (S1 Avg): {sofascore_stats.get('final_away_xg', 'N/A'):.2f}\n"
+    segment_text += f"- {home_name} xG (Adjusted by Corners - S1 Calc): {sofascore_stats.get('xg1_m2', 'N/A'):.2f}\n"
+    segment_text += f"- {away_name} xG (Adjusted by Corners - S1 Calc): {sofascore_stats.get('xg2_m2', 'N/A'):.2f}\n"
+    segment_text += f"- Both Teams To Score (BTTS% - S1 Avg): {sofascore_stats.get('btts_avg', 'N/A'):.2f}%\n"
+    segment_text += f"- Total Corners Expected (S1 Avg): Approx {sofascore_stats.get('final_home_corners', 0.0) + sofascore_stats.get('final_away_corners', 0.0):.2f} ({home_name} {sofascore_stats.get('final_home_corners', 'N/A'):.2f}, {away_name} {sofascore_stats.get('final_away_corners', 'N/A'):.2f})\n"
+    segment_text += f"- Total Yellow Cards Expected (S1 Avg): Approx {sofascore_stats.get('final_home_yellows', 0.0) + sofascore_stats.get('final_away_yellows', 0.0):.2f} ({home_name} {sofascore_stats.get('final_home_yellows', 'N/A'):.2f}, {away_name} {sofascore_stats.get('final_away_yellows', 'N/A'):.2f})\n"
+    segment_text += f"- Expected 1st Half Goals (Match Avg - S1 Avg): {sofascore_stats.get('first_half_avg_avg', 'N/A'):.2f}\n"
+    segment_text += f"- Expected 2nd Half Goals (Match Avg - S1 Avg): {sofascore_stats.get('second_half_avg_avg', 'N/A'):.2f}\n"
+    segment_text += f"- Calculated Handicaps (S1 Avg): {home_name} {sofascore_stats.get('h1_avg', 'N/A'):.2f}, {away_name} {sofascore_stats.get('h2_avg', 'N/A'):.2f}, Match {sofascore_stats.get('match_h_avg', 'N/A'):.2f}\n"
+    segment_text += f"- Match Handicap Abs (S2 Path 2 Input): {sofascore_stats.get('match_handicap_abs', 'N/A'):.2f}\n"
+
+    # --- Dynamically add all fetched detailed per-game averages to the prompt ---
+    segment_text += "\nDetailed Per-Game Averages (from SofaScore data basis - S1 Detailed Stats):\n"
+    home_detailed_stats = sofascore_stats.get('detailed_home_stats')
+    away_detailed_stats = sofascore_stats.get('detailed_away_stats')
+    
+    if home_detailed_stats and away_detailed_stats:
+        # Collect all unique _avg keys, excluding internal ones (starting with _)
+        all_avg_keys = sorted(
+            [k for k in home_detailed_stats if k.endswith('_avg') and not k.startswith('_')]
+        )
+        # Add 'matches' at the beginning as it's an important raw count, not an _avg key
+        if 'matches' in home_detailed_stats:
+            segment_text += f"- Matches Used (Source Avg)  : {home_name} {int(home_detailed_stats.get('matches', 0))}, {away_name} {int(away_detailed_stats.get('matches', 0))}\n"
+
+        for key_avg in all_avg_keys:
+            # Format key name for readability in the prompt
+            display_name = key_avg.replace('_avg', '')
+            display_name = re.sub(r'([A-Z])', r' \1', display_name).strip().title() # Convert camelCase to Title Case with spaces
+            
+            home_val = home_detailed_stats.get(key_avg, 'N/A')
+            away_val = away_detailed_stats.get(key_avg, 'N/A')
+            
+            home_val_str = f"{home_val:.2f}" if isinstance(home_val, (int, float)) else str(home_val)
+            away_val_str = f"{away_val:.2f}" if isinstance(away_val, (int, float)) else str(away_val)
+            
+            segment_text += f"- {display_name}: {home_name} {home_val_str}, {away_name} {away_val_str}\n"
+    else: 
+        segment_text += "(Detailed per-game averages not available)\n"
+
+    segment_text += "\nPredicted Match Results & Percentages (from internal model - S2 Combined):\n"
+    if script2_results:
+        sorted_script2_results = sorted(script2_results.items(), key=lambda item: item[1], reverse=True)
+        display_limit_s3_prompt = 15
+        for (g1, g2), percentage in sorted_script2_results[:display_limit_s3_prompt]:
+            segment_text += f"- {home_name} {g1} - {away_name} {g2}: {percentage:.{DECIMAL_PLACES_FINAL_S2}f}%\n"
+        if len(sorted_script2_results) > display_limit_s3_prompt:
+            segment_text += f"(... and {len(sorted_script2_results) - display_limit_s3_prompt} more results)\n"
+    else: segment_text += "(No predicted results available from internal model)\n"
+
+    segment_text += "\n---\n"
+    return segment_text
+
+
+# ===============================================
+# SECTION 5: Central Gemini Comparison & Analysis
+# New section to combine and send data to Gemini
+# ===============================================
+
+def central_gemini_comparison(original_data: Dict[str, Any], reversed_data: Dict[str, Any], scheduled_home_name: str, scheduled_away_name: str, gemini_prompt_template: str) -> Tuple[str, Dict[Tuple[int, int], float], Dict[Tuple[int, int], float]]:
+    """
+    Combines the analysis results from both original and reversed roles,
+    formats them for Gemini, and sends the comprehensive prompt.
+    Returns Gemini's response AND the Section 2 results from both pipelines for later display.
+    """
+    print("\n" + "="*80)
+    print("🧠 SECTION 5: Orchestrating Gemini AI Comparison 🧠")
+    print("🧠 القسم 5: تنسيق مقارنة تحليل Gemini AI 🧠")
+    print("==================================")
+    print(f"Overall Match for Gemini Analysis: 🏠 {scheduled_home_name} vs ✈️ {scheduled_away_name}")
+    
+    # --- Construct the Combined Prompt for Gemini ---
+    full_gemini_prompt = f"{gemini_prompt_template}\n\n"
+    full_gemini_prompt += f"Primary Match for Betting Recommendations: **{scheduled_home_name} vs {scheduled_away_name}**\n"
+    full_gemini_prompt += "Your task is to compare and contrast the following two sets of analysis data for the same match to provide the best possible comprehensive recommendations.\n"
+    full_gemini_prompt += "Specifically, identify common strong signals, or where they diverge, explain the most plausible prediction based on the overall data strength.\n"
+    full_gemini_prompt += "Remember to always state the teams in the order of Scheduled Home vs Scheduled Away in your final recommendations.\n\n"
+
+    full_gemini_prompt += "--- Detailed Input Data for Comparative Analysis ---\n"
+
+    # Add data from the Original Roles pipeline
+    full_gemini_prompt += original_data.get('gemini_prompt_segment', "Original Roles data segment not available.")
+    # Add data from the Reversed Roles pipeline
+    full_gemini_prompt += reversed_data.get('gemini_prompt_segment', "Reversed Roles data segment not available.")
+
+    print("\n--- Sending Combined Data to Gemini AI for Comprehensive Analysis ---")
+    gemini_final_response = _send_to_gemini(full_gemini_prompt)
+    print("--- Gemini AI processing complete ---")
+
+    # This function now returns Gemini's response and the S2 results for later display
+    return gemini_final_response, original_data.get('script2_final_results', {}), reversed_data.get('script2_final_results', {})
+
+
+# ===============================================
+# SECTION 4: MAIN ORCHESTRATOR
+# Controls the flow between the sections and the new pipelines
+# الجزء الرئيسي: يتحكم في تدفق العمليات
+# ===============================================
+
+if __name__ == "__main__":
+    print("\n" + "="*80)
+    print("⚽ Comprehensive Football Match Predictor - Combined Analysis ⚽")
+    print("⚽ محلل مباريات كرة القدم الشامل - التحليل المدمج ⚽")
+    print("="*80)
+
+    # Gemini Prompt Text (for the final comprehensive analysis)
+    gemini_prompt_template = """As a highly specialized AI football betting analyst, your task is to perform a dynamic, flexible, and data-driven analysis of this football match.
+
+🔍 Flexible Analytical Approach:
+You MUST NOT rigidly rely on a single data point or prediction model. Instead, adapt your recommendations based on a holistic synthesis of all available signals. Stay flexible and responsive to the interplay between various metrics.
+
+🎯 Input Data Sources:
+You have been provided with comprehensive statistics from two perspectives for this match:
+
+1. ⚽ Source 1: SofaScore Comprehensive Data
+   * 🔢 Primary Predictions: Key aggregated metrics (Overall xG, BTTS%, Win Probability, etc.)
+   * 📊 Detailed Per-Game Averages: Granular match-by-match stats for both teams (Shots, Goals, Cards, xG, Corners, etc.)
+
+2. 🎯 Source 2: Predicted Outcomes & Percentages
+   * List of potential FINAL scores for THIS match, each with a 'derived percentage' (AI-generated probability).
+
+🧠 Your Analysis & Recommendation Task:
+Use ALL of the above data sources — cross-reference, correlate, and adjust your evaluation dynamically. Your AI analysis must remain adaptive, reflecting the strength or weakness of signals, consistency between models, and contextual team performance trends.
+
+📌 Focus:
+Identify the MOST probable outcomes and value bets. Recommend not just what is likely, but what offers intelligent risk-reward balance.
+
+📑 Format:
+Present recommendations in a highly organized, easy-to-scan list.
+
+🧾 Justification:
+For EACH recommendation, provide a CONCISE, ONE-LINE MAXIMUM reason, citing the most relevant data point(s) or pattern(s).
+
+🔒 Important Principle – No Forced Predictions:
+You are NOT required to fill in every recommendation if the data does not strongly support it. You have full autonomy to skip or omit any bet type or recommendation that lacks sufficient justification. This applies equally to all types of bets — including overall bets, high-odds bets, correct scores, AND special market bets. Your goal is quality over quantity — suggest ONLY what your analysis identifies as genuinely valuable. If something feels statistically weak, do not propose it at all.
+
+📤 Output Structure:
+Present your analysis and recommendations using this STRICT format. Avoid repetition or unnecessary wording.
+
+---
+
+🏆 Summary of Top Data-Backed Recommendations:
+Based on the most compelling signals across ALL data, and following a flexible, adaptive AI interpretation:
+
+- 🥇 Best Overall Bet: [Market - Option]
+  - [CONCISE ONE-LINE Reason citing strong multi-source support,with freedom to override purely numeric probabilities If necessary]
+
+- 💰 Best High-Odds Bet: [Market - Option]
+  - [CONCISE ONE-LINE Reason referencing volatile but value-rich data ,with freedom to override purely numeric probabilities If necessary]
+
+- 📈 Most Likely Correct Score: [Score, e.g., 2-1]
+  - [Highly Flexible AI prediction from merging patterns in all sources,with freedom to override purely numeric probabilities If necessary ]
+
+- 🚨 Special Market Bet (If STRONGLY Justified): [Market - Option, e.g., Over 3.5 Shots on Target - Player X]
+  *(You may suggest any type of special event market — including but not limited to red cards, shots, offsides, fouls, passes, saves, player actions, or set pieces — but ONLY if your previous multi-source analysis identifies it as highly probable or statistically valuable. Do NOT limit yourself to preset types — propose what the data supports.)*
+
+---
+
+Begin Analysis:"""
+
+
+
+
+    # --- Step 0: Get Date and Select Matches ---
+    date_to_analyze = get_date_choice()
+    all_scheduled_events = fetch_schedule(date_to_analyze)
+
+    if not all_scheduled_events:
+            print(f"\nNo matches scheduled for {date_to_analyze}. Exiting.")
+            print(f"\nلا توجد مباريات مجدولة بتاريخ {date_to_analyze}. سيتم إنهاء البرنامج.")
+            sys.exit(0)
+
+    available_competitions = get_unique_competitions(all_scheduled_events)
+
+    selected_competitions_info = select_competitions(available_competitions)
+    if not selected_competitions_info:
+         print("\nNo competitions selected. Exiting.")
+         print("\nلم يتم اختيار أي مسابقات. سيتم إنهاء البرنامج.")
+         sys.exit(0)
+
+    selected_comp_tuples_set = set((comp_info['name'], comp_info['country']) for comp_info in selected_competitions_info)
+
+    matches_to_analyze = [
+         event for event in all_scheduled_events
+         if 'tournament' in event and 'category' in event['tournament'] and
+            (event['tournament'].get('name'), event['tournament'].get('category').get('name')) in selected_comp_tuples_set
+            and 'homeTeam' in event and 'awayTeam' in event
+            and event['homeTeam'].get('name') and event['awayTeam'].get('name')
+    ]
+
+    if not matches_to_analyze:
+             print("\nNo valid matches found in the selected competitions. Exiting.")
+             print("\nلم يتم العثور على مباريات صالحة في المسابقات المختارة. سيتم إنهاء البرنامج.")
+             sys.exit(0)
+
+    display_matches_scheduled(matches_to_analyze)
+    print(f"\nProceeding to analyze {len(matches_to_analyze)} matches...")
+    print(f"\nسيتم المتابعة بتحليل {len(matches_to_analyze)} مباراة...")
+
+    match_summaries = [] # To store the final Gemini response and S2 results for each match
+
+    # === هذا الجزء يطلب منك اختيار التصنيف والجزء لمرة واحدة فقط لكل المباريات ===
+    classification_choice = 0
+    part_choice = 0
+    while True:
+        try:
+            print(f"\n--- Select Stat Classification for ALL Matches in this Session ---")
+            print("1. Classification 1: Stats from Scheduled Match Tournament only")
+            print("   Part 1: Latest season in this tournament")
+            print("   Part 2: Immediately previous season in this tournament")
+            print("2. Classification 2: Stats combined from two different tournaments")
+            print("   Part 1: Avg of (Latest in Scheduled Tour) + (Latest in Domestic League)")
+            print("   Part 2: Avg of (Latest in Domestic League) + (Previous in Scheduled Tour)")
+
+            classification_choice = int(input("Choose Classification (1 or 2): "))
+            if classification_choice not in [1, 2]:
+                raise ValueError("Invalid Classification. Must be 1 or 2.")
+
+            part_choice = int(input(f"Choose Part (1 or 2) for Classification {classification_choice}: "))
+            if part_choice not in [1, 2]:
+                raise ValueError("Invalid Part. Must be 1 or 2.")
+            break
+        except ValueError as e:
+            print(f"Invalid input: {e}. Please enter numbers.")
+        except Exception as e:
+            print(f"An unexpected error occurred during choice selection: {e}")
+            print("Please try again.")
+
+    # === هذا هو بداية حلقة معالجة المباريات (يأتي مباشرة بعد الجزء أعلاه) ===
+
+    for i, match in enumerate(matches_to_analyze):
+        scheduled_home_team_name = match.get('homeTeam', {}).get('name', 'Unknown Scheduled Home')
+        scheduled_away_team_name = match.get('awayTeam', {}).get('name', 'Unknown Scheduled Away')
+        
+        # Extract context info for the scheduled match
+        scheduled_tournament_data = match.get('tournament', {})
+        # Use startTimestamp year as a reliable year for the match's context
+        scheduled_match_year_from_timestamp = str(datetime.datetime.fromtimestamp(match.get('startTimestamp', 0)).year)
+
+
+        if scheduled_home_team_name == 'Unknown Scheduled Home' or scheduled_away_team_name == 'Unknown Scheduled Away':
+             print(f"\nSkipping match {i+1}: Team names not found in schedule data.")
+             print(f"\nسيتم تخطي المباراة {i+1}: لم يتم العثور على أسماء الفرق في بيانات الجدول.")
+             continue
+
+        print("\n" + "="*80)
+        print(f"⚽ Starting Comprehensive Analysis for Scheduled Match {i+1}/{len(matches_to_analyze)}:")
+        print(f"   {scheduled_home_team_name} vs {scheduled_away_team_name}")
+        print("="*80)
+
+        current_match_scheduled_context_info = {
+            # 'tournament_id' from schedule is NOT the uniqueTournament.id from stats. 
+            # We pass name/country/year for resolution within _get_stats_based_on_classification.
+            'tournament_name': scheduled_tournament_data.get('name'),
+            'country_name': scheduled_tournament_data.get('category', {}).get('name', 'Unknown Country'),
+            'year': scheduled_match_year_from_timestamp,
+        }
+
+        # --- Run Pipeline 1: Original Roles ---
+        original_roles_data = run_original_roles_pipeline(
+            scheduled_home_team_name, scheduled_away_team_name, 
+            current_match_scheduled_context_info, classification_choice, part_choice
+        )
+
+        # --- Run Pipeline 2: Reversed Roles ---
+        reversed_roles_data = run_reversed_roles_pipeline(
+            scheduled_home_team_name, scheduled_away_team_name, 
+            current_match_scheduled_context_info, classification_choice, part_choice
+        )
+
+        # --- Section 5: Central Gemini Comparison & Analysis ---
+        gemini_final_analysis_text, original_s2_results, reversed_s2_results = central_gemini_comparison(
+            original_data=original_roles_data,
+            reversed_data=reversed_roles_data,
+            scheduled_home_name=scheduled_home_team_name,
+            scheduled_away_name=scheduled_away_team_name,
+            gemini_prompt_template=gemini_prompt_template
+        )
+
+        match_summaries.append({
+            'home_name': scheduled_home_team_name,
+            'away_name': scheduled_away_team_name,
+            'gemini_response': gemini_final_analysis_text,
+            'original_s2': original_s2_results,
+            'reversed_s2': reversed_s2_results,
+            'status': "Success" if original_roles_data.get('calculation_successful') and reversed_roles_data.get('calculation_successful') else "Partial/Failed"
+        })
+
+        print(f"\nFinished comprehensive analysis for Scheduled Match: {scheduled_home_team_name} vs {scheduled_away_team_name}.")
+        print("="*80)
+
+        if i < len(matches_to_analyze) - 1:
+            print("Pausing before next match...")
+            time.sleep(3) # Pause for 3 seconds between matches
+
+    # --- Final Summary ---
+    print("\n\n" + "="*80)
+    print("✨ FINAL MATCH ANALYSIS SUMMARY ✨")
+    print("✨ ملخص تحليل المباريات النهائي ✨")
+    print("==================================")
+
+    if not match_summaries:
+        print("No matches were successfully analyzed.")
+        print("لم يتم تحليل أي مباراة بنجاح.")
+    else:
+        for summary in match_summaries:
+            home_name = summary['home_name']
+            away_name = summary['away_name']
+            gemini_response = summary['gemini_response']
+            original_s2 = summary['original_s2']
+            reversed_s2 = summary['reversed_s2']
+            status = summary['status']
+
+            print("\n" + "-"*80)
+            print(f"📊 Overall Summary for: 🏠 {home_name} vs ✈️ {away_name} ({status})")
+            print("-" * 80)
+
+            # --- Display Section 2 results for Original Roles (Team A vs Team B) in Final Summary ---
+            if original_s2:
+                # Create a temporary analysis_data dict with scheduled names for display function
+                temp_original_analysis_data = {
+                    'home_team_name': home_name,
+                    'away_team_name': away_name
+                }
+                display_script2_results_formatted(original_s2, temp_original_analysis_data, f"Original Roles: {home_name} vs {away_name}")
+            else:
+                print(f"\nNo valid Section 2 results from Original Roles pipeline for {home_name} vs {away_name}.")
+
+            # --- Display Section 2 results for Reversed Roles (Team B vs Team A) in Final Summary ---
+            if reversed_s2:
+                # Create a temporary analysis_data dict with *reversed* scheduled names for display function
+                # The display function uses 'home_team_name' and 'away_team_name' from analysis_data
+     
+                # So we pass scheduled_away as home and scheduled_home as away
+                temp_reversed_analysis_data = {
+                    'home_team_name': away_name, # Analysis Home is Scheduled Away
+                    'away_team_name': home_name  # Analysis Away is Scheduled Home
+                }
+                display_script2_results_formatted(reversed_s2, temp_reversed_analysis_data, f"Reversed Roles: {away_name} vs {home_name}")
+            else:
+                print(f"\nNo valid Section 2 results from Reversed Roles pipeline for {home_name} vs {away_name}.")
+
+            print("\n" + "="*70)
+            print("⭐ Gemini AI's Comprehensive Analysis and Recommendations ⭐")
+            print(gemini_response)
+            print("="*70)
+            print("-" * 80)
+
+    print("\n" + "="*80)
+    print("✅ Analysis process complete. Exiting. ✅")
+    print("✅ عملية التحليل مكتملة. سيتم الإنهاء. ✅")
+    print("="*80)
